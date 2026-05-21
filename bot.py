@@ -1,174 +1,114 @@
 import os
-import asyncio
 import sqlite3
-import threading
-from flask import Flask
+import asyncio
+from quart import Quart
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- Configuration ---
-API_ID = 33902690  # Replace with your API ID
+# Render provides the PORT environment variable automatically
+PORT = int(os.environ.get("PORT", 8080))
+API_ID = 33902690
 API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
 BOT_TOKEN = '8697814237:AAHGUZ7d_9VM3rnUbMeD0nZEW3zSIj79NxM'
-ADMIN_ID = 8553702880  # <--- YOUR Telegram User ID (Get it from @userinfobot)
+ADMIN_ID = 8553702880
 DB_PATH = 'bot_data.db'
 
-app = Flask(__name__)
+# Use Quart instead of Flask for native asyncio support
+app = Quart(__name__)
 scheduler = AsyncIOScheduler()
+bot = TelegramClient('bot_interface', API_ID, API_HASH)
 
-# --- Security Middleware ---
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-# --- Database Setup ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, dest_id INTEGER, 
-                  filters TEXT, add_caption TEXT, last_msg_id INTEGER, interval INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS tasks 
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, dest_id INTEGER, 
+                      filters TEXT, add_caption TEXT, last_msg_id INTEGER, interval INTEGER)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
 
-init_db()
-
-# --- Telegram Bot Interface ---
-bot = TelegramClient('bot_interface', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
+# --- Bot Commands ---
 @bot.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    if not is_admin(event.sender_id):
-        return await event.reply("⛔ **Access Denied.** You are not authorized to use this bot.")
-    await event.reply("👋 **Admin Authenticated.** Use `/addforward` or `/login` to begin.")
+    if event.sender_id == ADMIN_ID:
+        await event.reply("👋 **Admin Authenticated.** Use `/addforward` or `/login`.")
 
 @bot.on(events.NewMessage(pattern='/login'))
 async def login(event):
-    if not is_admin(event.sender_id): return
-    
-    async with event.client.conversation(event.chat_id) as conv:
+    if event.sender_id != ADMIN_ID: return
+    async with bot.conversation(event.chat_id) as conv:
         await conv.send_message("🔑 Send your **Telethon Session String**:")
-        session_msg = await conv.get_response()
-        
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('session', ?)", (session_msg.text.strip(),))
-        conn.commit()
-        conn.close()
-        await conv.send_message("✅ **Session Saved.** The UserBot is now active.")
+        res = await conv.get_response()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('session', ?)", (res.text.strip(),))
+        await conv.send_message("✅ **Session Saved.**")
 
 @bot.on(events.NewMessage(pattern='/addforward'))
 async def add_forward(event):
-    if not is_admin(event.sender_id): return
-    
-    async with event.client.conversation(event.chat_id) as conv:
+    if event.sender_id != ADMIN_ID: return
+    async with bot.conversation(event.chat_id) as conv:
         try:
-            await conv.send_message("📤 **Source ID:** (e.g., -100123456)")
+            await conv.send_message("📤 **Source ID:**")
             src = int((await conv.get_response()).text)
-            
             await conv.send_message("📥 **Destination ID:**")
             dest = int((await conv.get_response()).text)
-            
-            await conv.send_message("🔍 **Filters:** (audio,video,document,text or 'all')")
-            filters = (await conv.get_response()).text.lower()
-            
-            await conv.send_message("📝 **Add Caption:** (Type your text or 'none')")
-            caption = (await conv.get_response()).text
-            caption = "" if caption.lower() == 'none' else caption
-            
-            await conv.send_message("🔢 **Starting Message ID:** (Use 1 for all past messages)")
-            last_id = int((await conv.get_response()).text)
+            await conv.send_message("🔍 **Filters:** (video,audio,text,all)")
+            filt = (await conv.get_response()).text.lower()
+            await conv.send_message("📝 **Caption:** (or 'none')")
+            cap = (await conv.get_response()).text
+            cap = "" if cap.lower() == 'none' else cap
+            await conv.send_message("🔢 **Start ID:**")
+            sid = int((await conv.get_response()).text)
 
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("INSERT INTO tasks (source_id, dest_id, filters, add_caption, last_msg_id, interval) VALUES (?,?,?,?,?,?)",
-                         (src, dest, filters, caption, last_id, 30))
-            conn.commit()
-            conn.close()
-            await conv.send_message("🚀 **Forwarding Task Activated!**")
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO tasks (source_id, dest_id, filters, add_caption, last_msg_id) VALUES (?,?,?,?,?)",
+                             (src, dest, filt, cap, sid))
+            await conv.send_message("🚀 **Task Added!**")
         except Exception as e:
-            await conv.send_message(f"❌ **Error:** {str(e)}")
+            await conv.send_message(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/removeforward'))
-async def remove_forward(event):
-    if not is_admin(event.sender_id): return
-    
-    conn = sqlite3.connect(DB_PATH)
-    tasks = conn.execute("SELECT id, source_id, dest_id FROM tasks").fetchall()
-    
-    if not tasks:
-        return await event.reply("No active tasks found.")
-    
-    msg = "**Select Task ID to remove:**\n"
-    for t in tasks:
-        msg += f"ID: `{t[0]}` | `{t[1]}` ➡️ `{t[2]}`\n"
-    
-    async with event.client.conversation(event.chat_id) as conv:
-        await conv.send_message(msg)
-        target_id = int((await conv.get_response()).text)
-        conn.execute("DELETE FROM tasks WHERE id=?", (target_id,))
-        conn.commit()
-        await conv.send_message(f"🗑 Task `{target_id}` deleted.")
-    conn.close()
-
-@bot.on(events.NewMessage(pattern='/statistics'))
-async def stats(event):
-    if not is_admin(event.sender_id): return
-    
-    conn = sqlite3.connect(DB_PATH)
-    tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    conn.close()
-    await event.reply(f"📊 **System Status**\nActive Forwarders: `{tasks}`\nAdmin: `Authorized`")
-
-# --- Background Forwarding Logic (Restricted Content Proof) ---
-async def process_forwarding():
-    conn = sqlite3.connect(DB_PATH)
-    res = conn.execute("SELECT value FROM settings WHERE key='session'").fetchone()
-    if not res: return
-    
-    async with TelegramClient(StringSession(res[0]), API_ID, API_HASH) as client:
+# --- Forwarding Logic ---
+async def process_tasks():
+    with sqlite3.connect(DB_PATH) as conn:
+        res = conn.execute("SELECT value FROM settings WHERE key='session'").fetchone()
+        if not res: return
         tasks = conn.execute("SELECT * FROM tasks").fetchall()
-        for task in tasks:
-            tid, src, dest, filters, caption, last_id, _ = task
-            filter_list = [f.strip() for f in filters.split(',')]
-            
+
+    async with TelegramClient(StringSession(res[0]), API_ID, API_HASH) as client:
+        for t in tasks:
+            tid, src, dest, filters, caption, last_id = t[0], t[1], t[2], t[3], t[4], t[5]
             async for msg in client.iter_messages(src, min_id=last_id, reverse=True):
                 try:
-                    # Filter matching
-                    content_type = 'text'
-                    if msg.photo: content_type = 'image'
-                    elif msg.video: content_type = 'video'
-                    elif msg.audio: content_type = 'audio'
-                    elif msg.document: content_type = 'document'
-                    
-                    if 'all' not in filter_list and content_type not in filter_list:
-                        continue
-
-                    # Bypassing Restrictions via Download/Upload
-                    final_caption = f"{msg.text or ''}\n\n{caption}".strip()
-                    
+                    # Media Handling & Strip Restrictions
                     if msg.media:
-                        tmp_file = await client.download_media(msg)
-                        await client.send_file(dest, tmp_file, caption=final_caption)
-                        if os.path.exists(tmp_file): os.remove(tmp_file)
+                        path = await client.download_media(msg)
+                        await client.send_file(dest, path, caption=f"{msg.text or ''}\n{caption}")
+                        if os.path.exists(path): os.remove(path)
                     else:
-                        await client.send_message(dest, final_caption)
+                        await client.send_message(dest, f"{msg.text}\n{caption}")
                     
-                    conn.execute("UPDATE tasks SET last_msg_id = ? WHERE id = ?", (msg.id, tid))
-                    conn.commit()
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("UPDATE tasks SET last_msg_id = ? WHERE id = ?", (msg.id, tid))
                 except Exception as e:
-                    print(f"Task {tid} Error: {e}")
-    conn.close()
+                    print(f"Forward Error: {e}")
 
-# --- Web Server & Main ---
+# --- Web & Lifecycle ---
 @app.route('/')
-def health_check():
-    return "Bot Online", 200
+async def health():
+    return "Bot is running", 200
 
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+async def main():
+    init_db()
+    await bot.start(bot_token=BOT_TOKEN)
+    scheduler.add_job(process_tasks, 'interval', minutes=30)
+    scheduler.start()
+    
+    # Run the Quart web server and Telethon bot concurrently
+    config = asyncio.gather(
+        bot.run_until_disconnected(),
+        app.run_task(host='0.0.0.0', port=PORT)
+    )
+    await config
 
 if __name__ == '__main__':
-    threading.Thread(target=run_flask, daemon=True).start()
-    scheduler.add_job(process_forwarding, 'interval', minutes=30)
-    scheduler.start()
-    bot.run_until_disconnected()
+    asyncio.run(main())
