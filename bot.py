@@ -8,7 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- Configuration ---
 # Render provides the PORT environment variable automatically
-PORT = int(os.environ.get("PORT", 8080))
+PORT = 8080
 API_ID = 33902690
 API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
 BOT_TOKEN = '8697814237:AAHGUZ7d_9VM3rnUbMeD0nZEW3zSIj79NxM'
