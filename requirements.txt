@@ -2,4 +2,4 @@ telethon
 apscheduler
 flask
 python-dotenv
-
+gunicorn
