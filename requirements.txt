@@ -1,0 +1,5 @@
+telethon
+apscheduler
+flask
+python-dotenv
+
