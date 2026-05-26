@@ -1,8 +1,25 @@
+# =====================================================================
+# STEP 1: MODERN PYTHON EVENT LOOP PATCH (CRITICAL FOR RENDER DEPLOYS)
+# =====================================================================
 import asyncio
+import sys
+
+# Forces an active asyncio loop into the thread to stop older Pyrogram 
+# source structures from crashing instantly on startup.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# =====================================================================
+# STEP 2: PACKAGES & CLIENT ROUTINES
+# =====================================================================
+import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# --- CONFIGURATION ---
+# --- HARDCODED TEST CREDENTIALS ---
 API_ID = 33902690
 API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
 BOT_TOKEN = '8697814237:AAHGUZ7d_9VM3rnUbMeD0nZEW3zSIj79NxM'
@@ -10,17 +27,23 @@ BOT_TOKEN = '8697814237:AAHGUZ7d_9VM3rnUbMeD0nZEW3zSIj79NxM'
 TARGET_BOT = "AudioConverterNewBot"
 DELAY_SECONDS = 20
 
-# Initialize the main bot
+# Initialize Main Bot
 bot = Client("ControllerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Global variable to store your user session
+# Global tracker for user session
 user_client = None
+
+# =====================================================================
+# STEP 3: TELEGRAM BOT COMMANDS
+# =====================================================================
 
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message: Message):
     await message.reply_text(
-        "👋 Hi! Use `/addsession <your_session_string>` to connect.\n"
-        "After that, any file you send here will be forwarded directly via your user account with a 20s delay."
+        "👋 Welcome!\n\n"
+        "1. Send `/addsession <string>` to authenticate your user account.\n"
+        "2. Send any media file directly to this bot.\n"
+        "3. Your user account will forward it to @AudioConverterNewBot with a 20-second delay."
     )
 
 @bot.on_message(filters.command("addsession"))
@@ -28,57 +51,72 @@ async def add_session_cmd(client, message: Message):
     global user_client
     
     if len(message.command) < 2:
-        await message.reply_text("❌ Missing session string! Example: `/addsession AgAAAA...`")
+        await message.reply_text("❌ Please provide a session string.\nExample: `/addsession AgAAAA...`")
         return
     
     session_string = message.text.split(None, 1)[1].strip()
-    status = await message.reply_text("🔄 Connecting to your user account...")
+    status = await message.reply_text("🔄 Connecting user account session...")
 
     try:
+        # Tear down preexisting user clients if they are running
         if user_client:
-            try: await user_client.stop()
-            except: pass
+            try:
+                await user_client.stop()
+            except:
+                pass
 
-        user_client = Client("UserSession", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+        # Spin up new user session 
+        user_client = Client(
+            "UserSession",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string
+        )
         await user_client.start()
         
         me = await user_client.get_me()
-        await status.edit_text(f"✅ Connected as **{me.first_name}** (@{me.username})!")
+        await status.edit_text(f"✅ Successfully connected as **{me.first_name}** (@{me.username})!")
         
     except Exception as e:
-        await status.edit_text(f"❌ Connection failed: {str(e)}")
+        await status.edit_text(f"❌ Connection failed. Error: {str(e)}")
         user_client = None
+
+# =====================================================================
+# STEP 4: DIRECT FILE FORWARDING ROUTINE WITH PACING DELAY
+# =====================================================================
 
 @bot.on_message(filters.document | filters.audio | filters.video | filters.voice)
 async def handle_forward_directly(client, message: Message):
     global user_client
     
     if not user_client:
-        await message.reply_text("⚠️ Please link your account first using `/addsession`")
+        await message.reply_text("⚠️ Please hook up a user session first using `/addsession <string>`")
         return
 
-    # 1. Notify the user that the delay timer has started
-    status = await message.reply_text(f"⏳ Waiting {DELAY_SECONDS} seconds before forwarding...")
+    # Post an inline update to see execution tracking in real-time
+    status = await message.reply_text(f"⏳ Standby... Pacing execution for {DELAY_SECONDS} seconds.")
     
     try:
-        # 2. Wait exactly 20 seconds
+        # Pacing throttle execution block
         await asyncio.sleep(DELAY_SECONDS)
 
-        # 3. Update status and forward the message as a user
-        await status.edit_text(f"🚀 Forwarding to @{TARGET_BOT}...")
+        await status.edit_text(f"🚀 Forwarding cleanly to @{TARGET_BOT}...")
         
-        # user_client forwards the exact message to the target bot using its message ID
+        # User client replicates the original message via direct chat forwarding pipelines
         await user_client.forward_messages(
             chat_id=TARGET_BOT,
             from_chat_id=message.chat.id,
             message_ids=message.id
         )
         
-        await status.edit_text("✅ Message successfully forwarded!")
+        await status.edit_text("✅ File forwarded successfully!")
 
     except Exception as e:
-        await status.edit_text(f"❌ Error while forwarding: {str(e)}")
+        await status.edit_text(f"❌ Failed to transfer message: {str(e)}")
 
+# =====================================================================
+# STEP 5: APPLICATION RUNNER
+# =====================================================================
 if __name__ == "__main__":
-    print("🤖 Direct Forward Bot is running...")
+    print("🤖 Application runtime triggered. Monitoring incoming updates...")
     bot.run()
