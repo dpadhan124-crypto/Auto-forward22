@@ -27,7 +27,7 @@ API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
 BOT_TOKEN = '8697814237:AAERHXm7y28XcNMIkZVlV2ib6K6uGHq-gdY'
 
 TARGET_BOT = "AudioConverterNewBot"
-DELAY_SECONDS = 20
+DELAY_SECONDS = 3
 
 # Initialize Main Bot
 bot = Client("ControllerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
