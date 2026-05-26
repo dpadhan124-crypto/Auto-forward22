@@ -1,11 +1,9 @@
 # =====================================================================
-# STEP 1: MODERN PYTHON EVENT LOOP PATCH (CRITICAL FOR RENDER DEPLOYS)
+# STEP 1: MODERN PYTHON EVENT LOOP PATCH
 # =====================================================================
 import asyncio
 import sys
 
-# Forces an active asyncio loop into the thread to stop older Pyrogram 
-# source structures from crashing instantly on startup.
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -16,16 +14,19 @@ except RuntimeError:
 # STEP 2: PACKAGES & CLIENT ROUTINES
 # =====================================================================
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # --- HARDCODED TEST CREDENTIALS ---
 API_ID = 33902690
 API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
+# Updated with your new token:
 BOT_TOKEN = '8697814237:AAERHXm7y28XcNMIkZVlV2ib6K6uGHq-gdY'
 
 TARGET_BOT = "AudioConverterNewBot"
-DELAY_SECONDS = 20
+DELAY_SECONDS = 30
 
 # Initialize Main Bot
 bot = Client("ControllerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -34,7 +35,24 @@ bot = Client("ControllerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 user_client = None
 
 # =====================================================================
-# STEP 3: TELEGRAM BOT COMMANDS
+# STEP 3: DUMMY SERVER FOR RENDER WEB SERVICE PORT BINDING
+# =====================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+def run_health_server():
+    # Render automatically passes the PORT environment variable
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"🌍 Dummy health server listening on port {port} for Render requirements...")
+    server.serve_forever()
+
+# =====================================================================
+# STEP 4: TELEGRAM BOT COMMANDS
 # =====================================================================
 
 @bot.on_message(filters.command("start"))
@@ -58,14 +76,12 @@ async def add_session_cmd(client, message: Message):
     status = await message.reply_text("🔄 Connecting user account session...")
 
     try:
-        # Tear down preexisting user clients if they are running
         if user_client:
             try:
                 await user_client.stop()
             except:
                 pass
 
-        # Spin up new user session 
         user_client = Client(
             "UserSession",
             api_id=API_ID,
@@ -82,7 +98,7 @@ async def add_session_cmd(client, message: Message):
         user_client = None
 
 # =====================================================================
-# STEP 4: DIRECT FILE FORWARDING ROUTINE WITH PACING DELAY
+# STEP 5: DIRECT FILE FORWARDING ROUTINE WITH PACING DELAY
 # =====================================================================
 
 @bot.on_message(filters.document | filters.audio | filters.video | filters.voice)
@@ -93,16 +109,12 @@ async def handle_forward_directly(client, message: Message):
         await message.reply_text("⚠️ Please hook up a user session first using `/addsession <string>`")
         return
 
-    # Post an inline update to see execution tracking in real-time
     status = await message.reply_text(f"⏳ Standby... Pacing execution for {DELAY_SECONDS} seconds.")
     
     try:
-        # Pacing throttle execution block
         await asyncio.sleep(DELAY_SECONDS)
-
         await status.edit_text(f"🚀 Forwarding cleanly to @{TARGET_BOT}...")
         
-        # User client replicates the original message via direct chat forwarding pipelines
         await user_client.forward_messages(
             chat_id=TARGET_BOT,
             from_chat_id=message.chat.id,
@@ -115,8 +127,12 @@ async def handle_forward_directly(client, message: Message):
         await status.edit_text(f"❌ Failed to transfer message: {str(e)}")
 
 # =====================================================================
-# STEP 5: APPLICATION RUNNER
+# STEP 6: APPLICATION RUNNER
 # =====================================================================
 if __name__ == "__main__":
-    print("🤖 Application runtime triggered. Monitoring incoming updates...")
+    # Start the web port binder thread so Render Web Service doesn't panic
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    print("🤖 Bot application runtime triggered. Monitoring incoming updates...")
     bot.run()
+
