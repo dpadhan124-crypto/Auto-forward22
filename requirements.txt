@@ -1,6 +1,2 @@
-telethon
-apscheduler
-quart
-flask
-python-dotenv
-gunicorn
+pyrogram
+tgcrypto
