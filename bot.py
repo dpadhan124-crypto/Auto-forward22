@@ -4,8 +4,8 @@ import time
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update
-from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
@@ -150,10 +150,11 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task securely using Telethon userbot session to bypass private channel blocks."""
+    """Processes a single automated task securely using Telethon userbot session."""
     global current_task_cancel_event
     current_task_cancel_event.clear()
 
+    update = task_data['update']
     status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
     reverse_order = task_data['reverse_order']
@@ -163,7 +164,7 @@ async def process_forwarding_task(task_data):
 
     async with client:
         try:
-            await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
+            await status_msg.edit_text("⚙️ Setting up bots and creating destination forum topic...")
             channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
         except Exception as e:
             error_reason = f"Setup failed: `{type(e).__name__}: {str(e)}`"
@@ -199,7 +200,7 @@ async def process_forwarding_task(task_data):
         start_time = time.time()
 
         await status_msg.edit_text(
-            f"🚀 **Forwarding Task Started**\n\n"
+            f"🚀 **Automated Forwarding Started**\n\n"
             f"📊 Progress: [░░░░░░░░░░] 0%\n"
             f"📁 Total Files: {total_files}\n"
             f"✅ Forwarded: 0\n"
@@ -208,12 +209,7 @@ async def process_forwarding_task(task_data):
             parse_mode="Markdown"
         )
 
-        try:
-            target_entity = await client.get_entity(TARGET_GROUP_ID)
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Failed to resolve target group: {e}")
-            return
-
+        bot = update.get_bot()
         for idx, msg_id in enumerate(message_ids, start=1):
             if current_task_cancel_event.is_set():
                 await status_msg.edit_text(
@@ -225,24 +221,37 @@ async def process_forwarding_task(task_data):
                 return
 
             success = False
-            while not success:
+            retries = 3
+            while retries > 0 and not success:
                 try:
-                    await client.forward_messages(
-                        entity=target_entity,
-                        messages=msg_id,
-                        from_peer=channel_entity,
-                        reply_to=int(message_thread_id) if message_thread_id else None
-                    )
+                    kwargs = {
+                        "chat_id": TARGET_GROUP_ID,
+                        "from_chat_id": channel_entity.id,
+                        "message_id": msg_id
+                    }
+                    if message_thread_id:
+                        kwargs["message_thread_id"] = int(message_thread_id)
+
+                    await bot.copy_message(**kwargs)
                     forwarded_files += 1
                     success = True
-                except FloodWaitError as fwe:
-                    logger.warning(f"Telethon FloodWait during forwarding: sleeping for {fwe.seconds} seconds")
-                    await asyncio.sleep(fwe.seconds + 2)
                 except Exception as err:
-                    last_error_reason = f"`{type(err).__name__}: {str(err)}`"
-                    logger.error(f"Error forwarding message {msg_id}: {err}")
-                    error_files += 1
-                    break
+                    err_str = str(err).lower()
+                    if "flood" in err_str or "retry after" in err_str:
+                        import re
+                        match = re.search(r"retry after (\d+)", err_str)
+                        sleep_time = int(match.group(1)) if match else 15
+                        logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
+                        await asyncio.sleep(sleep_time + 2)
+                        retries -= 1
+                    else:
+                        last_error_reason = f"`{type(err).__name__}: {str(err)}`"
+                        logger.error(f"Error copying message {msg_id}: {err}")
+                        error_files += 1
+                        break
+
+            if not success and retries == 0 and not error_files:
+                error_files += 1
 
             if idx % 5 == 0 or idx == total_files:
                 elapsed = time.time() - start_time
@@ -252,7 +261,7 @@ async def process_forwarding_task(task_data):
 
                 try:
                     await status_msg.edit_text(
-                        f"🚀 **Forwarding Task in Progress**\n\n"
+                        f"🚀 **Automated Forwarding in Progress**\n\n"
                         f"📊 Progress: {generate_progress_bar(idx, total_files)}\n"
                         f"📁 Total Files: {total_files}\n"
                         f"✅ Forwarded: {forwarded_files}\n"
@@ -264,7 +273,7 @@ async def process_forwarding_task(task_data):
                     pass
 
         summary_text = (
-            f"✨ **Forwarding Task Completed!**\n\n"
+            f"✨ **Automated Forwarding Completed!**\n\n"
             f"📊 Progress: [██████████] 100%\n"
             f"📁 Total Files: {total_files}\n"
             f"✅ Forwarded: {forwarded_files}\n"
@@ -282,7 +291,8 @@ async def task_worker():
     while True:
         task_data = await task_queue.get()
         try:
-            await process_forwarding_task(task_data)
+            if task_data['type'] == 'automated':
+                await process_forwarding_task(task_data)
         except Exception as e:
             logger.error(f"Error in task worker queue: {e}")
         finally:
@@ -292,10 +302,11 @@ async def task_worker():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles /start command."""
     await update.message.reply_text(
-        "👋 Welcome! I am your automated forwarding and management bot with Quest Queue & Error Diagnostics.\n\n"
+        "👋 Welcome! I am your automated forwarding and management bot.\n\n"
         "Commands:\n"
         "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Add forwarding task to queue\n"
+        "• `/send {channel_id} [r]` - Setup source channel and prompt mode selection (Automated/Manual)\n"
+        "• `/forward` - Interactive custom file collection mode\n"
         "• `/cancel` - Cancel active process and clear remaining queue",
         parse_mode="Markdown"
     )
@@ -308,6 +319,198 @@ async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
     context.user_data['step'] = 'waiting_session_string'
+
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /send command by promoting bots, creating topic, and presenting choice buttons."""
+    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
+    if not session_to_use:
+        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
+        return
+
+    source_channel_str = args[0]
+    reverse_order = len(args) > 1 and args[1].lower() == 'r'
+
+    status_msg = await update.message.reply_text("⚙️ Setting up bots in source channel and creating destination forum topic...")
+
+    client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
+    async with client:
+        try:
+            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Setup failed: {e}")
+            return
+
+    # Save details into user_data for mode callback execution
+    context.user_data['source_channel_str'] = source_channel_str
+    context.user_data['reverse_order'] = reverse_order
+    context.user_data['topic_id'] = message_thread_id
+    context.user_data['status_msg_id'] = status_msg.id
+
+    keyboard = [
+        [InlineKeyboardButton("🤖 Automated Forwarding", callback_data="mode_auto")],
+        [InlineKeyboardButton("📝 Manual Forwarding (Custom Files)", callback_data="mode_manual")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await status_msg.edit_text(
+        f"✅ **Admins successfully promoted & Topic created!**\n\n"
+        f"Please select your preferred forwarding mode below:",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+
+async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles selection between Automated and Manual forwarding after successful setup."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    source_channel_str = context.user_data.get('source_channel_str')
+    reverse_order = context.user_data.get('reverse_order', False)
+    topic_id = context.user_data.get('topic_id')
+
+    if data == "mode_auto":
+        queue_position = task_queue.qsize() + 1
+        await query.edit_message_text(
+            f"📋 **Automated Task Added to Quest Queue!**\n"
+            f"📌 Position in Queue: `{queue_position}`\n"
+            f"⏳ Waiting for previous tasks to finish...",
+            parse_mode="Markdown"
+        )
+        task_data = {
+            'type': 'automated',
+            'update': update,
+            'source_channel_str': source_channel_str,
+            'reverse_order': reverse_order,
+            'status_msg': query.message
+        }
+        await task_queue.put(task_data)
+
+    elif data == "mode_manual":
+        context.user_data['manual_topic_id'] = topic_id
+        context.user_data['manual_order'] = 'normal'
+        context.user_data['manual_files'] = []
+        context.user_data['step'] = 'collecting_manual_files'
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
+            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
+        ]
+        await query.edit_message_text(
+            f"📝 **Manual Forwarding Mode Initialized**\n"
+            f"• Destination Topic ID: `{topic_id}`\n"
+            f"• Current Order: `Normal`\n\n"
+            f"Send files to the bot one by one. Click **Done** when finished.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+
+async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles inline buttons for manual forwarding settings."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "toggle_manual_order":
+        current_order = context.user_data.get('manual_order', 'normal')
+        new_order = 'reverse' if current_order == 'normal' else 'normal'
+        context.user_data['manual_order'] = new_order
+
+        order_text = "Reverse" if new_order == 'reverse' else "Normal"
+        topic_id = context.user_data.get('manual_topic_id')
+
+        keyboard = [
+            [InlineKeyboardButton(f"🔄 Order: {order_text.capitalize()}", callback_data="toggle_manual_order")],
+            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
+        ]
+        await query.edit_message_text(
+            f"📝 **Manual Forwarding Mode Initialized**\n"
+            f"• Destination Topic ID: `{topic_id}`\n"
+            f"• Current Order: `{order_text}`\n\n"
+            f"Send files to the bot one by one. Click **Done** when finished.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data == "trigger_manual_don":
+        await execute_manual_forward(query.message, context)
+
+
+async def execute_manual_forward(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processes and dispatches manually collected files anonymously into the destination topic."""
+    files = context.user_data.get('manual_files', [])
+    if not files:
+        await message.reply_text("⚠️ No files have been saved yet! Send files first.", parse_mode="Markdown")
+        return
+
+    order = context.user_data.get('manual_order', 'normal')
+    topic_id = context.user_data.get('manual_topic_id')
+
+    if order == 'reverse':
+        files.reverse()
+
+    status_msg = await message.reply_text(f"🚀 Starting anonymous dispatch of `{len(files)}` files...")
+
+    forwarded = 0
+    errors = 0
+    bot = message.get_bot()
+
+    for item in files:
+        chat_id = item['chat_id']
+        msg_id = item['msg_id']
+        try:
+            kwargs = {
+                "chat_id": TARGET_GROUP_ID,
+                "from_chat_id": chat_id,
+                "message_id": msg_id
+            }
+            if topic_id:
+                kwargs["message_thread_id"] = int(topic_id)
+
+            await bot.copy_message(**kwargs)
+            forwarded += 1
+            await asyncio.sleep(0.5)
+        except Exception as err:
+            logger.error(f"Error copying manual file {msg_id}: {err}")
+            errors += 1
+
+    context.user_data['manual_files'] = []
+    context.user_data['step'] = None
+
+    await status_msg.edit_text(
+        f"✨ **Manual Forwarding Completed!**\n\n"
+        f"✅ Forwarded Anonymously: `{forwarded}`\n"
+        f"❌ Errors: `{errors}`",
+        parse_mode="Markdown"
+    )
+
+
+async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Standalone /forward command for manual custom file routing."""
+    context.user_data['manual_order'] = 'normal'
+    context.user_data['manual_topic_id'] = None
+    context.user_data['manual_files'] = []
+    context.user_data['step'] = 'collecting_manual_files'
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
+        [InlineKeyboardButton("📌 Set Topic ID", callback_data="set_manual_topic")],
+        [InlineKeyboardButton("✅ Done / Start", callback_data="trigger_manual_don")]
+    ]
+    await update.message.reply_text(
+        "📦 **Custom Manual Forwarding Mode**\n\n"
+        "Send files to the bot one by one, then click **Done**.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,44 +527,15 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             break
 
+    context.user_data['step'] = None
+    context.user_data['manual_files'] = []
+
     await update.message.reply_text(
         f"🛑 **Cancellation Triggered!**\n"
         f"• Active process aborted.\n"
         f"• Cleared `{cleared_count}` pending tasks from the quest queue.",
         parse_mode="Markdown"
     )
-
-
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /send command by adding tasks into the sequential quest queue."""
-    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
-    if not session_to_use:
-        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
-        return
-
-    source_channel_str = args[0]
-    reverse_order = len(args) > 1 and args[1].lower() == 'r'
-
-    queue_position = task_queue.qsize() + 1
-    status_msg = await update.message.reply_text(
-        f"📋 Task added to Quest Queue!\n"
-        f"📌 Position in Queue: `{queue_position}`\n"
-        f"⏳ Waiting for previous tasks to finish...",
-        parse_mode="Markdown"
-    )
-
-    task_data = {
-        'source_channel_str': source_channel_str,
-        'reverse_order': reverse_order,
-        'status_msg': status_msg
-    }
-
-    await task_queue.put(task_data)
 
 
 async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -374,6 +548,15 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         RUNTIME_SESSION_STRING = update.message.text.strip()
         user_data['step'] = None
         await update.message.reply_text("✅ **Session String successfully saved** for this runtime session!", parse_mode="Markdown")
+        return
+
+    elif step == 'collecting_manual_files':
+        user_data['manual_files'].append({
+            'chat_id': update.effective_chat.id,
+            'msg_id': update.message.id
+        })
+        count = len(user_data['manual_files'])
+        await update.message.reply_text(f"📥 File #{count} saved. Send more files or click Done.", parse_mode="Markdown")
         return
 
 
@@ -397,9 +580,12 @@ async def run_bot():
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(CommandHandler("forward", forward_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
+    application.add_handler(CallbackQueryHandler(mode_selection_callback, pattern="^mode_"))
+    application.add_handler(CallbackQueryHandler(manual_callback, pattern="^(toggle_manual_order|trigger_manual_don|set_manual_topic)$"))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_flow))
     
     await application.initialize()
     await application.start()
