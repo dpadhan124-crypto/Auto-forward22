@@ -404,7 +404,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text(f"❌ Setup failed: {e}")
             return
 
-    # Save state for mode choice, storing the created topic ID correctly
     context.user_data['source_channel_str'] = source_channel_str
     context.user_data['reverse_order'] = reverse_order
     context.user_data['topic_id'] = message_thread_id
@@ -424,7 +423,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles selection between Automated and Manual forwarding and pins the initialized control panel message."""
+    """Handles selection between Automated and Manual forwarding."""
     query = update.callback_query
     await query.answer()
 
@@ -461,7 +460,7 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
 
         keyboard = [
             [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
-            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
+            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_done")]
         ]
         
         panel_msg = await query.message.reply_text(
@@ -498,7 +497,7 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         keyboard = [
             [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
-            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
+            [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_done")]
         ]
         await query.edit_message_text(
             f"📝 **Manual Forwarding Mode Initialized**\n"
@@ -509,7 +508,7 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown"
         )
 
-    elif data == "trigger_manual_don":
+    elif data == "trigger_manual_done":
         await execute_manual_forward(query.message, context)
 
 
@@ -571,7 +570,7 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     keyboard = [
         [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
-        [InlineKeyboardButton("✅ Done / Start", callback_data="trigger_manual_don")]
+        [InlineKeyboardButton("✅ Done / Start", callback_data="trigger_manual_done")]
     ]
     
     panel_msg = await update.message.reply_text(
@@ -672,7 +671,7 @@ async def run_bot():
     application.add_handler(CommandHandler("add_session", add_session_command))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^(open_settings|toggle_dest_type|set_target_id)$"))
     application.add_handler(CallbackQueryHandler(mode_selection_callback, pattern="^mode_"))
-    application.add_handler(CallbackQueryHandler(manual_callback, pattern="^(toggle_manual_order|trigger_manual_don)$"))
+    application.add_handler(CallbackQueryHandler(manual_callback, pattern="^(toggle_manual_order|trigger_manual_done)$"))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_flow))
     
     await application.initialize()
