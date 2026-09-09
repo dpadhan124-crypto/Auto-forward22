@@ -41,20 +41,21 @@ def generate_progress_bar(completed, total):
 
 
 async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
-    """Promotes predefined bots with FloodWait safety, fetches channel entity, and creates a forum topic."""
+    """Promotes predefined bots with native FloodWait handling, fetches channel entity, and creates a forum topic."""
     if isinstance(channel_input, str):
         channel_input = channel_input.strip()
         if channel_input.startswith("-") or channel_input.isdigit():
             channel_input = int(channel_input)
 
-    try:
-        channel = await client.get_entity(channel_input)
-    except FloodWaitError as fwe:
-        logger.warning(f"FloodWait on get_entity: sleeping for {fwe.seconds}s")
-        await asyncio.sleep(fwe.seconds + 2)
-        channel = await client.get_entity(channel_input)
-    except Exception as e:
-        raise ValueError(f"Could not resolve channel ID/username '{channel_input}': {e}")
+    while True:
+        try:
+            channel = await client.get_entity(channel_input)
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on get_entity: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception as e:
+            raise ValueError(f"Could not resolve channel ID/username '{channel_input}': {e}")
 
     channel_title = getattr(channel, 'title', f"Channel {getattr(channel, 'id', 'Unknown')}")
 
@@ -62,87 +63,93 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
     b2 = BOT_2_USERNAME.strip().replace("@", "")
 
     # 1. Invite and promote Bot 1 (Dps_storiesbot)
-    try:
-        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
-    except FloodWaitError as fwe:
-        await asyncio.sleep(fwe.seconds + 2)
-        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
-    except Exception:
-        pass
+    while True:
+        try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on invite Bot 1: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception:
+            break
     
-    try:
-        await client.edit_admin(
-            entity=channel,
-            user=b1,
-            change_info=True, 
-            post_messages=True, 
-            edit_messages=True,
-            delete_messages=True, 
-            ban_users=True, 
-            invite_users=True,
-            pin_messages=True, 
-            add_admins=True, 
-            anonymous=False,
-            manage_call=True
-        )
-    except FloodWaitError as fwe:
-        await asyncio.sleep(fwe.seconds + 2)
-        await client.edit_admin(
-            entity=channel, user=b1, change_info=True, post_messages=True, 
-            edit_messages=True, delete_messages=True, ban_users=True, 
-            invite_users=True, pin_messages=True, add_admins=True, 
-            anonymous=False, manage_call=True
-        )
-    except Exception as e:
-        logger.warning(f"Notice regarding Bot 1 promotion: {e}")
+    while True:
+        try:
+            await client.edit_admin(
+                entity=channel,
+                user=b1,
+                change_info=True, 
+                post_messages=True, 
+                edit_messages=True,
+                delete_messages=True, 
+                ban_users=True, 
+                invite_users=True,
+                pin_messages=True, 
+                add_admins=True, 
+                anonymous=False,
+                manage_call=True
+            )
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on edit_admin Bot 1: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception as e:
+            logger.warning(f"Notice regarding Bot 1 promotion: {e}")
+            break
 
     # 2. Invite and promote Bot 2 (Testdp112232bot)
-    try:
-        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
-    except FloodWaitError as fwe:
-        await asyncio.sleep(fwe.seconds + 2)
-        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
-    except Exception:
-        pass
+    while True:
+        try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on invite Bot 2: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception:
+            break
 
-    try:
-        await client.edit_admin(
-            entity=channel,
-            user=b2,
-            post_messages=True,
-            edit_messages=True,
-            delete_messages=True
-        )
-    except FloodWaitError as fwe:
-        await asyncio.sleep(fwe.seconds + 2)
-        await client.edit_admin(
-            entity=channel, user=b2, post_messages=True,
-            edit_messages=True, delete_messages=True
-        )
-    except Exception as e:
-        logger.warning(f"Notice regarding Bot 2 promotion: {e}")
+    while True:
+        try:
+            await client.edit_admin(
+                entity=channel,
+                user=b2,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True
+            )
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on edit_admin Bot 2: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception as e:
+            logger.warning(f"Notice regarding Bot 2 promotion: {e}")
+            break
 
-    # 3. Create a forum topic in the target group
+    # 3. Create a forum topic in the target group with FloodWait protection
     thread_id = None
-    try:
-        result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
-            channel=target_group_id,
-            title=channel_title
-        ))
-        for update in result.updates:
-            if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
-                thread_id = update.id
-                break
-    except FloodWaitError as fwe:
-        await asyncio.sleep(fwe.seconds + 2)
-    except Exception as e:
-        logger.error(f"Failed to create forum topic via Telethon: {e}")
+    while True:
+        try:
+            result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
+                channel=target_group_id,
+                title=channel_title
+            ))
+            for update in result.updates:
+                if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
+                    thread_id = update.id
+                    break
+            break
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on CreateForumTopic: sleeping for {fwe.seconds} seconds")
+            await asyncio.sleep(fwe.seconds + 2)
+        except Exception as e:
+            logger.error(f"Failed to create forum topic via Telethon: {e}")
+            break
 
     return channel, thread_id
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task using Telethon userbot session for forceful forwarding and FloodWait protection."""
+    """Processes a single task using Telethon userbot session with robust native FloodWait looping."""
     status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
     reverse_order = task_data['reverse_order']
@@ -159,14 +166,17 @@ async def process_forwarding_task(task_data):
             return
 
         message_ids = []
-        try:
-            async for message in client.iter_messages(channel_entity):
-                message_ids.append(message.id)
-        except FloodWaitError as fwe:
-            logger.warning(f"FloodWait during iteration: sleeping for {fwe.seconds}s")
-            await asyncio.sleep(fwe.seconds + 2)
-            async for message in client.iter_messages(channel_entity):
-                message_ids.append(message.id)
+        while True:
+            try:
+                async for message in client.iter_messages(channel_entity):
+                    message_ids.append(message.id)
+                break
+            except FloodWaitError as fwe:
+                logger.warning(f"FloodWait during iteration: sleeping for {fwe.seconds} seconds")
+                await asyncio.sleep(fwe.seconds + 2)
+            except Exception as e:
+                logger.error(f"Error fetching messages: {e}")
+                break
 
         if reverse_order:
             message_ids.reverse()
@@ -186,12 +196,15 @@ async def process_forwarding_task(task_data):
             parse_mode="Markdown"
         )
 
-        target_entity = await client.get_entity(TARGET_GROUP_ID)
+        try:
+            target_entity = await client.get_entity(TARGET_GROUP_ID)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to resolve target group: {e}")
+            return
 
         for idx, msg_id in enumerate(message_ids, start=1):
             success = False
-            retries = 3
-            while retries > 0 and not success:
+            while not success:
                 try:
                     await client.forward_messages(
                         entity=target_entity,
@@ -202,16 +215,12 @@ async def process_forwarding_task(task_data):
                     forwarded_files += 1
                     success = True
                 except FloodWaitError as fwe:
-                    logger.warning(f"Telethon FloodWait: sleeping for {fwe.seconds}s")
+                    logger.warning(f"Telethon FloodWait during forwarding: sleeping for {fwe.seconds} seconds")
                     await asyncio.sleep(fwe.seconds + 2)
-                    retries -= 1
                 except Exception as err:
                     logger.error(f"Error forwarding message {msg_id}: {err}")
                     error_files += 1
                     break
-
-            if not success and retries == 0:
-                error_files += 1
 
             if idx % 5 == 0 or idx == total_files:
                 elapsed = time.time() - start_time
@@ -244,7 +253,7 @@ async def process_forwarding_task(task_data):
 
 
 async def task_worker():
-    """Background worker that pulls tasks sequentially from the queue."""
+    """Background worker that continuously pulls tasks from the queue sequentially (Quest flow)."""
     while True:
         task_data = await task_queue.get()
         try:
@@ -261,7 +270,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "👋 Welcome! I am your automated forwarding and management bot with Quest Queue support.\n\n"
         "Commands:\n"
         "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Add forwarding task to the quest queue",
+        "• `/send {channel_id} [r]` - Add forwarding task safely into the quest queue",
         parse_mode="Markdown"
     )
 
