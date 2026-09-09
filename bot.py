@@ -45,7 +45,7 @@ def generate_progress_bar(completed, total):
 
 
 async def setup_bots_and_topic_telethon(client, channel_input):
-    """Promotes predefined bots, fetches channel entity, and creates a forum topic reliably."""
+    """Promotes predefined bots, fetches channel entity, and creates a forum topic reliably using messages.createForumTopic."""
     if isinstance(channel_input, str):
         channel_input = channel_input.strip()
         if channel_input.startswith("-") or channel_input.isdigit():
@@ -114,22 +114,20 @@ async def setup_bots_and_topic_telethon(client, channel_input):
             logger.warning(f"Notice regarding Bot 2 promotion: {e}")
             break
 
-    # 3. Create a forum topic if destination_type is 'topic'
+    # 3. Create a forum topic using messages.createForumTopic if destination_type is 'topic'
     thread_id = None
     if CONFIG["destination_type"] == "topic":
-        target_group = int(CONFIG["target_chat_id"])
         while True:
             try:
-                result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
-                    channel=target_group,
+                target_peer = await client.get_input_entity(CONFIG["target_chat_id"])
+                result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
+                    peer=target_peer,
                     title=channel_title
                 ))
                 for update in result.updates:
                     if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
                         thread_id = update.id
                         break
-                    elif hasattr(update, 'id') and isinstance(update, telethon.tl.types.UpdateChannel):
-                        pass
                 if not thread_id and hasattr(result, 'updates'):
                     for u in result.updates:
                         if hasattr(u, 'id'):
@@ -139,7 +137,7 @@ async def setup_bots_and_topic_telethon(client, channel_input):
             except FloodWaitError as fwe:
                 await asyncio.sleep(fwe.seconds + 2)
             except Exception as e:
-                logger.error(f"Failed to create forum topic via Telethon: {e}")
+                logger.error(f"Failed to create forum topic via Telethon messages.createForumTopic: {e}")
                 break
 
     return channel, thread_id
@@ -160,7 +158,7 @@ async def process_forwarding_task(task_data):
 
     async with client:
         try:
-            await status_msg.edit_text("⚙️ Setting up bots and preparing destination...")
+            await status_msg.edit_text("⚙️ Setting up bots in source channel and creating destination topic...")
             channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str)
         except Exception as e:
             error_reason = f"Setup failed: `{type(e).__name__}: {str(e)}`"
@@ -195,7 +193,7 @@ async def process_forwarding_task(task_data):
         start_time = time.time()
 
         await status_msg.edit_text(
-            f"🚀 **Automated Forwarding Started**\n\n"
+            f"🚀 **Automated Forwarding Started** (Topic ID: `{message_thread_id}`)\n\n"
             f"📊 Progress: [░░░░░░░░░░] 0%\n"
             f"📁 Total Files: {total_files}\n"
             f"✅ Forwarded: 0\n"
@@ -305,11 +303,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "👋 Welcome! I am your automated forwarding and management bot.\n\n"
         "Commands:\n"
-        "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Setup source channel and choose mode\n"
-        "• `/forward` - Interactive custom file collection mode\n"
-        "• `/settings` - Configure target group ID and destination types\n"
-        "• `/cancel` - Cancel active process and clear queue",
+        "• /add_session - Save your Telethon session string\n"
+        "• `/send -100` - Setup source channel and choose mode\n"
+        "• /forward - Interactive custom file collection mode\n"
+        "• /settings - Configure target group ID and destination types\n"
+        "• /cancel - Cancel active process and clear queue",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
@@ -359,7 +357,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton(f"📁 Destination Mode: {CONFIG['destination_type'].capitalize()}", callback_data="toggle_dest_type")],
             [InlineKeyboardButton(f"🎯 Target Chat ID: {CONFIG['target_chat_id']}", callback_data="set_target_id")]
         ]
-        await query.edit_message_text(
+        await query.edit_text(
             "⚙️ **Bot Configuration Settings**\n\n"
             f"• **Target Chat ID**: `{CONFIG['target_chat_id']}`\n"
             f"• **Destination Type**: `{CONFIG['destination_type']}`",
@@ -385,18 +383,18 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handles /send command by promoting bots, creating topic/destination, and presenting choice buttons."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     if not session_to_use:
-        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ No session string configured! Please use /add_session first.", parse_mode="Markdown")
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/send -100 r`", parse_mode="Markdown")
         return
 
     source_channel_str = args[0]
     reverse_order = len(args) > 1 and args[1].lower() == 'r'
 
-    status_msg = await update.message.reply_text("⚙️ Setting up bots in source channel and setting up destination...")
+    status_msg = await update.message.reply_text("⚙️ Setting up bots in source channel and creating destination topic...")
 
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
     async with client:
@@ -406,7 +404,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text(f"❌ Setup failed: {e}")
             return
 
-    # Save state for mode choice, ensuring valid topic mapping
+    # Save state for mode choice, storing the created topic ID correctly
     context.user_data['source_channel_str'] = source_channel_str
     context.user_data['reverse_order'] = reverse_order
     context.user_data['topic_id'] = message_thread_id
@@ -418,7 +416,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await status_msg.edit_text(
-        f"✅ **Admins successfully promoted & Destination ready!**\n\n"
+        f"✅ **Admins promoted & Topic created successfully!** (Topic ID: `{message_thread_id}`)\n\n"
         f"Please select your preferred forwarding mode below:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
@@ -426,7 +424,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles selection between Automated and Manual forwarding and pins/sends the control panel."""
+    """Handles selection between Automated and Manual forwarding and pins the initialized control panel message."""
     query = update.callback_query
     await query.answer()
 
