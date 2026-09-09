@@ -45,7 +45,7 @@ def generate_progress_bar(completed, total):
 
 
 async def setup_bots_and_topic_telethon(client, channel_input):
-    """Promotes predefined bots, fetches channel entity, and handles destination setup based on config."""
+    """Promotes predefined bots, fetches channel entity, and creates a forum topic reliably."""
     if isinstance(channel_input, str):
         channel_input = channel_input.strip()
         if channel_input.startswith("-") or channel_input.isdigit():
@@ -117,16 +117,24 @@ async def setup_bots_and_topic_telethon(client, channel_input):
     # 3. Create a forum topic if destination_type is 'topic'
     thread_id = None
     if CONFIG["destination_type"] == "topic":
+        target_group = int(CONFIG["target_chat_id"])
         while True:
             try:
-                result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
-                    peer=CONFIG["target_chat_id"],
+                result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
+                    channel=target_group,
                     title=channel_title
                 ))
                 for update in result.updates:
                     if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
                         thread_id = update.id
                         break
+                    elif hasattr(update, 'id') and isinstance(update, telethon.tl.types.UpdateChannel):
+                        pass
+                if not thread_id and hasattr(result, 'updates'):
+                    for u in result.updates:
+                        if hasattr(u, 'id'):
+                            thread_id = u.id
+                            break
                 break
             except FloodWaitError as fwe:
                 await asyncio.sleep(fwe.seconds + 2)
@@ -398,7 +406,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text(f"❌ Setup failed: {e}")
             return
 
-    # Save state for mode choice
+    # Save state for mode choice, ensuring valid topic mapping
     context.user_data['source_channel_str'] = source_channel_str
     context.user_data['reverse_order'] = reverse_order
     context.user_data['topic_id'] = message_thread_id
@@ -418,7 +426,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles selection between Automated and Manual forwarding."""
+    """Handles selection between Automated and Manual forwarding and pins/sends the control panel."""
     query = update.callback_query
     await query.answer()
 
@@ -446,18 +454,19 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
 
     elif data == "mode_manual":
         context.user_data['manual_topic_id'] = topic_id
-        context.user_data['manual_order'] = 'normal'
+        context.user_data['manual_order'] = 'reverse' if reverse_order else 'normal'
         context.user_data['manual_files'] = []
         context.user_data['step'] = 'collecting_manual_files'
 
-        order_text = "Normal"
-        topic_display = topic_id if topic_id else "Default Chat"
+        order_text = "Reverse" if reverse_order else "Normal"
+        topic_display = str(topic_id) if topic_id else "Default Chat"
 
         keyboard = [
             [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
             [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
         ]
-        await query.edit_message_text(
+        
+        panel_msg = await query.message.reply_text(
             f"📝 **Manual Forwarding Mode Initialized**\n"
             f"• Destination Topic ID: `{topic_display}`\n"
             f"• Current Order: `{order_text}`\n\n"
@@ -465,6 +474,13 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
+
+        try:
+            await panel_msg.pin()
+        except Exception as e:
+            logger.warning(f"Could not pin manual mode message: {e}")
+
+        await query.message.delete()
 
 
 async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,7 +496,7 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         order_text = "Reverse" if new_order == 'reverse' else "Normal"
         topic_id = context.user_data.get('manual_topic_id')
-        topic_display = topic_id if topic_id else "Default Chat"
+        topic_display = str(topic_id) if topic_id else "Default Chat"
 
         keyboard = [
             [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
@@ -549,7 +565,7 @@ async def execute_manual_forward(message, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Standalone /forward command for manual custom file routing."""
+    """Standalone /forward command for manual custom file routing with pinned status panel."""
     context.user_data['manual_order'] = 'normal'
     context.user_data['manual_topic_id'] = None
     context.user_data['manual_files'] = []
@@ -559,12 +575,20 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
         [InlineKeyboardButton("✅ Done / Start", callback_data="trigger_manual_don")]
     ]
-    await update.message.reply_text(
-        "📝 **Custom Manual Forwarding Mode**\n\n"
-        "Send files to the bot one by one, then click **Done**.",
+    
+    panel_msg = await update.message.reply_text(
+        "📝 **Manual Forwarding Mode Initialized**\n"
+        "• Destination Topic ID: `Default Chat`\n"
+        "• Current Order: `Normal`\n\n"
+        "Send files to the bot one by one. Click **Done** when finished.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+
+    try:
+        await panel_msg.pin()
+    except Exception as e:
+        logger.warning(f"Could not pin /forward status panel: {e}")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
