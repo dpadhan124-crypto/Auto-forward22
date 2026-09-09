@@ -1,199 +1,238 @@
-# =====================================================================
-# STEP 1: MODERN PYTHON EVENT LOOP PATCH
-# =====================================================================
-import asyncio
-import sys
-
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-# =====================================================================
-# STEP 2: PACKAGES & CLIENT ROUTINES
-# =====================================================================
 import os
-import threading
-import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait
+import asyncio
+import logging
+from aiohttp import web
+from pyrogram import Client, filters, idle
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- HARDCODED TEST CREDENTIALS ---
-API_ID = 33902690
-API_HASH = '08dfcf902b1bec83fef7aaab24c18278'
-BOT_TOKEN = '8697814237:AAERHXm7y28XcNMIkZVlV2ib6K6uGHq-gdY'
+# Setup Comprehensive Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-TARGET_BOT = "AudioConverterNewBot"
-DELAY_SECONDS = 3
+# Environment Configuration (Removed SESSION_STRING env dependency)
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+PORT = int(os.environ.get("PORT", 8080))
 
-# Initialize Main Bot
-bot = Client("ControllerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Initialize Pyrogram Bot Client
+bot = Client(
+    "bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-# Global tracker for user session
-user_client = None
+# Global dynamic user client instance
+user = None
 
-# =====================================================================
-# STEP 3: DUMMY SERVER FOR RENDER WEB SERVICE PORT BINDING
-# =====================================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+# In-memory State Configuration
+config = {
+    "order": "old_to_new",
+    "remove_sender": False,
+    "remove_caption": False,
+    "backup_group": None
+}
 
-def run_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"🌍 Dummy health server listening on port {port} for Render requirements...")
-    server.serve_forever()
+def get_settings_ui():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔄 Order: {'Old -> New' if config['order'] == 'old_to_new' else 'New -> Old'}", callback_data="toggle_order")],
+        [InlineKeyboardButton(f"👤 Remove Sender: {'YES (Copy)' if config['remove_sender'] else 'NO (Forward)'}", callback_data="toggle_sender")],
+        [InlineKeyboardButton(f"📝 Caption: {'Removed' if config['remove_caption'] else 'Original'}", callback_data="toggle_caption")]
+    ])
 
-# =====================================================================
-# STEP 4: TELEGRAM BOT COMMANDS
-# =====================================================================
+@bot.on_message(filters.incoming)
+async def log_incoming_messages(client, message):
+    logger.info(f"Received update from chat {message.chat.id} ({message.chat.type}): {message.text or '[Media/Other]'}")
 
 @bot.on_message(filters.command("start"))
-async def start_cmd(client, message: Message):
-    await message.reply_text(
-        "👋 Welcome!\n\n"
-        "1. Send `/addsession <string>` to authenticate your user account.\n"
-        "2. To copy a range from a channel, send:\n"
-        "`/copychannel https://t.me/REBORN_IN_MARTIAL_WORLD_uk/1665 https://t.me/REBORN_IN_MARTIAL_WORLD_uk/1698`\n"
-        "3. Alternatively, send any media file directly to me, and I will copy it over."
-    )
-
-@bot.on_message(filters.command("addsession"))
-async def add_session_cmd(client, message: Message):
-    global user_client
-    
-    if len(message.command) < 2:
-        await message.reply_text("❌ Please provide a session string.\nExample: `/addsession AgAAAA...`")
-        return
-    
-    session_string = message.text.split(None, 1)[1].strip()
-    status = await message.reply_text("🔄 Connecting user account session...")
-
+async def cmd_start(client, message):
+    logger.info("Executing /start command handler.")
     try:
-        if user_client:
-            try:
-                await user_client.stop()
-            except:
-                pass
+        bot_me = await client.get_me()
+        add_link = f"https://t.me/{bot_me.username}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins"
+        
+        await message.reply(
+            "**Forwarding & Backup Controller**\n\n"
+            "1. Use `/login <session_string>` to connect your user session.\n"
+            "2. Use `/setbackup <group_id>` to specify your backup group.\n"
+            "3. Configure your settings via `/settings`.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add to Channel / Group", url=add_link)]])
+        )
+        logger.info("/start response sent successfully.")
+    except Exception as e:
+        logger.error(f"Error handling /start command: {e}", exc_info=True)
 
-        user_client = Client(
-            "UserSession",
+@bot.on_message(filters.command("login"))
+async def cmd_login(client, message):
+    global user
+    logger.info("Executing /login command handler.")
+    if len(message.command) < 2:
+        return await message.reply("Usage: `/login <pyrogram_session_string>`")
+    
+    session_str = message.command[1]
+    status = await message.reply("🔄 Verifying session string...")
+    try:
+        if user and user.is_connected:
+            await user.stop()
+        
+        user = Client(
+            "user_dynamic_session",
             api_id=API_ID,
             api_hash=API_HASH,
-            session_string=session_string
+            session_string=session_str
         )
-        await user_client.start()
-        
-        me = await user_client.get_me()
-        await status.edit_text(f"✅ Successfully connected as **{me.first_name}** (@{me.username})!")
-        
+        await user.start()
+        me = await user.get_me()
+        await status.edit(f"✅ Successfully logged in as `{me.first_name}` (`{me.id}`)!")
+        logger.info(f"User session successfully authenticated for ID {me.id}")
     except Exception as e:
-        await status.edit_text(f"❌ Connection failed. Error: {str(e)}")
-        user_client = None
+        logger.error(f"Failed to login user session: {e}", exc_info=True)
+        user = None
+        await status.edit(f"❌ Login failed: {e}")
 
+@bot.on_message(filters.command("settings"))
+async def cmd_settings(client, message):
+    logger.info("Executing /settings command handler.")
+    try:
+        await message.reply("**⚙️ Configuration Settings**", reply_markup=get_settings_ui())
+    except Exception as e:
+        logger.error(f"Error in /settings: {e}", exc_info=True)
 
-@bot.on_message(filters.command("copychannel"))
-async def copy_channel_range_cmd(client, message: Message):
-    global user_client
-    
-    if not user_client:
-        await message.reply_text("⚠️ Please hook up a user session first using `/addsession <string>`")
-        return
-
-    # Expecting: /copychannel <start_link> <end_link>
-    if len(message.command) < 3:
-        await message.reply_text("❌ Usage: `/copychannel <start_link> <end_link>`")
-        return
-
-    start_link = message.command[1]
-    end_link = message.command[2]
-
-    # Regex to extract channel username/id and message id
-    pattern = r"t\.me/(?:c/)?([^/]+)/(\d+)"
-    start_match = re.search(pattern, start_link)
-    end_match = re.search(pattern, end_link)
-
-    if not start_match or not end_match:
-        await message.reply_text("❌ Invalid Telegram links provided. Please make sure they match `https://t.me/...` formatting.")
-        return
-
-    channel_identifier = start_match.group(1)
-    # Handle private channel integer IDs if applicable
-    if channel_identifier.isdigit():
-        channel_identifier = int(f"-100{channel_identifier}")
-
-    start_id = int(start_match.group(2))
-    end_id = int(end_match.group(2))
-
-    if start_id > end_id:
-        await message.reply_text("❌ Start ID cannot be greater than End ID.")
-        return
-
-    status = await message.reply_text(f"🚀 Batch task started. Copying messages from ID {start_id} to {end_id}...")
-
-    # Iterate through the range of messages
-    for msg_id in range(start_id, end_id + 1):
-        try:
-            # Fetch the message from the source channel via user session
-            src_msg = await user_client.get_messages(chat_id=channel_identifier, message_ids=msg_id)
+@bot.on_callback_query(filters.regex("toggle_"))
+async def callback_settings(client, callback_query):
+    logger.info(f"Received callback query: {callback_query.data}")
+    try:
+        action = callback_query.data.split("_")[1]
+        
+        if action == "order":
+            config["order"] = "new_to_old" if config["order"] == "old_to_new" else "old_to_new"
+        elif action == "sender":
+            config["remove_sender"] = not config["remove_sender"]
+        elif action == "caption":
+            config["remove_caption"] = not config["remove_caption"]
             
-            if src_msg and not src_msg.empty:
-                await status.edit_text(f"⏳ Pacing execution. Waiting {DELAY_SECONDS}s before sending message ID {msg_id}...")
-                await asyncio.sleep(DELAY_SECONDS)
+        await callback_query.message.edit_reply_markup(get_settings_ui())
+        await callback_query.answer("Settings updated!")
+    except Exception as e:
+        logger.error(f"Error processing callback query: {e}", exc_info=True)
+
+@bot.on_message(filters.command("setbackup"))
+async def cmd_set_backup(client, message):
+    logger.info("Executing /setbackup command handler.")
+    if len(message.command) < 2:
+        return await message.reply("Usage: `/setbackup <group_id>`")
+    try:
+        config["backup_group"] = int(message.command[1])
+        await message.reply(f"✅ Backup topic-enabled group set to: `{config['backup_group']}`")
+    except ValueError:
+        logger.error("Invalid group ID provided for backup.")
+        await message.reply("❌ Invalid group ID. Must be an integer.")
+
+@bot.on_message(filters.command("backup"))
+async def cmd_backup(client, message):
+    logger.info("Executing /backup command handler.")
+    if not user or not user.is_connected:
+        return await message.reply("⚠️ **User Session Required:** Send `/login <session_string>` to the bot first.")
+    if not config["backup_group"]:
+        return await message.reply("⚠️ **Target Missing:** Use `/setbackup <group_id>` first.")
+        
+    try:
+        source_chat = int(message.command[1])
+    except (IndexError, ValueError):
+        return await message.reply("Usage: `/backup <channel_id>`")
+
+    status = await message.reply("🔄 Initializing backup process...")
+    try:
+        chat_info = await user.get_chat(source_chat)
+        topic = await user.create_forum_topic(config["backup_group"], f"{chat_info.title} Backup")
+        topic_id = topic.id
+        
+        await status.edit("📥 Indexing messages...")
+        messages = []
+        async for msg in user.get_chat_history(source_chat):
+            messages.append(msg)
+            
+        if config["order"] == "old_to_new":
+            messages.reverse()
+            
+        await status.edit(f"🚀 Processing {len(messages)} messages to topic ID: {topic_id}...")
+        
+        for msg in messages:
+            caption = None if config["remove_caption"] else (msg.caption or msg.text)
+            try:
+                if config["remove_sender"]:
+                    await msg.copy(config["backup_group"], message_thread_id=topic_id, caption=caption)
+                else:
+                    await msg.forward(config["backup_group"], message_thread_id=topic_id)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"Skipped msg {msg.id}: {e}")
                 
-                # Using copy_message instead of forward_messages to hide the original source
-                await src_msg.copy(chat_id=TARGET_BOT)
-                print(f"Copied message ID: {msg_id}")
-            else:
-                await status.edit_text(f"⏩ Message ID {msg_id} is empty or deleted. Skipping...")
-                
-        except FloodWait as fw:
-            await status.edit_text(f"⚠️ Hit Telegram FloodWait. Sleeping for {fw.value} seconds...")
-            await asyncio.sleep(fw.value)
-        except Exception as e:
-            print(f"Failed to copy message ID {msg_id}: {str(e)}")
-            # Fail silently on individual message issues to keep the batch loop running
+        await status.edit("✅ Backup complete.")
+    except Exception as e:
+        logger.error(f"Error during backup process: {e}", exc_info=True)
+        await status.edit(f"❌ Error during backup: {str(e)}")
 
-    await status.edit_text(f"✅ Finished! Successfully copied available messages from {start_id} to {end_id} cleanly.")
-
-
-# =====================================================================
-# STEP 5: DIRECT FILE COPY ROUTINE WITH PACING DELAY (FOR IN-BOT DMs)
-# =====================================================================
-
-@bot.on_message(filters.document | filters.audio | filters.video | filters.voice)
-async def handle_copy_directly(client, message: Message):
-    global user_client
-    
-    if not user_client:
-        await message.reply_text("⚠️ Please hook up a user session first using `/addsession <string>`")
-        return
-
-    status = await message.reply_text(f"⏳ Standby... Pacing execution for {DELAY_SECONDS} seconds.")
+@bot.on_message(filters.command("forward_topic"))
+async def cmd_fwd_topic(client, message):
+    logger.info("Executing /forward_topic command handler.")
+    if len(message.command) < 4:
+        return await message.reply("Usage: `/forward_topic <source_id> <target_id> <topic_id>`")
     
     try:
-        await asyncio.sleep(DELAY_SECONDS)
-        await status.edit_text(f"🚀 Copying cleanly to @{TARGET_BOT}...")
-        
-        # copy_message scrubs the forwarded header metadata 
-        await message.copy(chat_id=TARGET_BOT)
-        
-        await status.edit_text("✅ File copied successfully!")
+        source_id, target_id, topic_id = map(int, message.command[1:4])
+    except ValueError:
+        return await message.reply("❌ IDs must be valid integers.")
 
+    status = await message.reply("🔄 Forwarding latest messages to topic...")
+    try:
+        async for msg in client.get_chat_history(source_id, limit=50):
+            if config["remove_sender"]:
+                await msg.copy(target_id, message_thread_id=topic_id)
+            else:
+                await msg.forward(target_id, message_thread_id=topic_id)
+            await asyncio.sleep(1.5)
+        await status.edit("✅ Topic forward complete.")
     except Exception as e:
-        await status.edit_text(f"❌ Failed to transfer message: {str(e)}")
+        logger.error(f"Error in forward_topic: {e}", exc_info=True)
+        await status.edit(f"❌ Error: {e}")
 
-# =====================================================================
-# STEP 6: APPLICATION RUNNER
-# =====================================================================
+# Render Web Service Keep-Alive
+async def web_server():
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Web server started on port {PORT}")
+
+async def main():
+    logger.info("Starting application services...")
+    server_task = asyncio.create_task(web_server())
+    
+    try:
+        await bot.start()
+        logger.info("Bot client started successfully.")
+    except Exception as e:
+        logger.critical(f"Failed to start bot client: {e}", exc_info=True)
+        return
+            
+    logger.info("Core systems online and listening for updates.")
+    await idle()
+    
+    logger.info("Shutting down clients...")
+    await bot.stop()
+    if user and user.is_connected:
+        await user.stop()
+    server_task.cancel()
+
 if __name__ == "__main__":
-    threading.Thread(target=run_health_server, daemon=True).start()
-    print("🤖 Bot application runtime triggered. Monitoring incoming updates...")
-    bot.run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped manually by user.")
