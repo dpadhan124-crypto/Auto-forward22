@@ -3,7 +3,7 @@ import asyncio
 import time
 import os
 from telegram import Update
-from telegram.ext import Application, ContextTypes, CommandHandler, filters
+from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 import telethon.tl.functions.channels
@@ -16,9 +16,11 @@ logger = logging.getLogger(__name__)
 # --- CONFIGURATION (Render Environment Safe) ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TARGET_GROUP_ID = -1004440356312
+
+# Runtime storage for session string if added via command
+RUNTIME_SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 
 def generate_progress_bar(completed, total):
@@ -28,9 +30,12 @@ def generate_progress_bar(completed, total):
     bar = "█" * filled + "░" * (10 - filled)
     return f"[{bar}] {int(percentage * 100)}%"
 
+
 async def promote_bots_telethon(channel_input, bot1_username, bot2_username):
     """Promotes both specified bot usernames with respective permission levels using Telethon."""
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
+    client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
+    
     async with client:
         if channel_input.startswith("-") or channel_input.isdigit():
             channel_input = int(channel_input)
@@ -73,8 +78,23 @@ async def promote_bots_telethon(channel_input, bot1_username, bot2_username):
 
         return channel.id
 
+
+async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /add_session command to initiate writing a session string."""
+    await update.message.reply_text(
+        "🔑 Please send your **Telethon Session String** in the next message:",
+        parse_mode="Markdown"
+    )
+    context.user_data['step'] = 'waiting_session_string'
+
+
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles /send command, asks for the 2 bot usernames interactively via chat, and processes queue."""
+    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
+    if not session_to_use:
+        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
+        return
+
     args = context.args
     if not args:
         await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
@@ -85,17 +105,24 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text("🤖 Please send the **Username of Bot 1** (Full Permissions):", parse_mode="Markdown")
     
-    # Simple Conversation flow helper using context user data
     context.user_data['step'] = 'waiting_bot1'
     context.user_data['source_channel'] = source_channel_str
     context.user_data['reverse'] = reverse_order
 
+
 async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manages multi-step conversational input for bot usernames required on Render."""
+    """Manages multi-step conversational input for sessions and bot usernames."""
+    global RUNTIME_SESSION_STRING
     user_data = context.user_data
     step = user_data.get('step')
 
-    if step == 'waiting_bot1':
+    if step == 'waiting_session_string':
+        RUNTIME_SESSION_STRING = update.message.text.strip()
+        user_data['step'] = None
+        await update.message.reply_text("✅ **Session String successfully saved** for this session!", parse_mode="Markdown")
+        return
+
+    elif step == 'waiting_bot1':
         user_data['bot1'] = update.message.text
         user_data['step'] = 'waiting_bot2'
         await update.message.reply_text("🤖 Got it. Now send the **Username of Bot 2** (Forwarder):", parse_mode="Markdown")
@@ -119,7 +146,8 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # Fetch message IDs
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
+        client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
         message_ids = []
         async with client:
             channel_entity = await client.get_entity(source_chat_id)
@@ -186,12 +214,15 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown"
         )
 
+
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(CommandHandler("add_session", add_session_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
