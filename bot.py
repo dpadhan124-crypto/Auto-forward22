@@ -8,9 +8,9 @@ from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 import telethon.tl.functions.channels
 import telethon.tl.functions.messages
-from telethon.tl.types import ChatAdminRights
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -27,8 +27,9 @@ TARGET_GROUP_ID = -1004440356312
 BOT_1_USERNAME = "Dps_storiesbot"   # Full administrative permissions
 BOT_2_USERNAME = "Testdp112232bot"  # Forwarder / message copying bot
 
-# Runtime storage for session string if added via command
+# Runtime storage for session string and task queue
 RUNTIME_SESSION_STRING = os.environ.get("SESSION_STRING", "")
+task_queue = asyncio.Queue()
 
 
 def generate_progress_bar(completed, total):
@@ -40,23 +41,35 @@ def generate_progress_bar(completed, total):
 
 
 async def setup_bots_and_topic_telethon(channel_input, target_group_id):
-    """Promotes predefined bots using raw/compatible ChatAdminRights, fetches channel title, and creates a forum topic."""
+    """Promotes predefined bots with FloodWait safety, fetches channel entity, and creates a forum topic."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
     
     async with client:
-        if channel_input.startswith("-") or channel_input.isdigit():
-            channel_input = int(channel_input)
+        if isinstance(channel_input, str):
+            channel_input = channel_input.strip()
+            if channel_input.startswith("-") or channel_input.isdigit():
+                channel_input = int(channel_input)
 
-        channel = await client.get_entity(channel_input)
-        channel_title = getattr(channel, 'title', f"Channel {channel.id}")
+        try:
+            channel = await client.get_entity(channel_input)
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait on get_entity: sleeping for {fwe.seconds}s")
+            await asyncio.sleep(fwe.seconds + 2)
+            channel = await client.get_entity(channel_input)
+        except Exception as e:
+            raise ValueError(f"Could not resolve channel ID/username '{channel_input}': {e}")
 
-        # Clean usernames
+        channel_title = getattr(channel, 'title', f"Channel {getattr(channel, 'id', 'Unknown')}")
+
         b1 = BOT_1_USERNAME.strip().replace("@", "")
         b2 = BOT_2_USERNAME.strip().replace("@", "")
 
-        # 1. Invite and promote Bot 1 (Dps_storiesbot with maximum standard admin rights)
+        # 1. Invite and promote Bot 1 (Dps_storiesbot)
         try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
+        except FloodWaitError as fwe:
+            await asyncio.sleep(fwe.seconds + 2)
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
         except Exception:
             pass
@@ -76,11 +89,22 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
                 anonymous=False,
                 manage_call=True
             )
+        except FloodWaitError as fwe:
+            await asyncio.sleep(fwe.seconds + 2)
+            await client.edit_admin(
+                entity=channel, user=b1, change_info=True, post_messages=True, 
+                edit_messages=True, delete_messages=True, ban_users=True, 
+                invite_users=True, pin_messages=True, add_admins=True, 
+                anonymous=False, manage_call=True
+            )
         except Exception as e:
-            logger.error(f"Error promoting Bot 1: {e}")
+            logger.warning(f"Notice regarding Bot 1 promotion: {e}")
 
-        # 2. Invite and promote Bot 2 (Testdp112232bot with standard forwarding/posting permissions)
+        # 2. Invite and promote Bot 2 (Testdp112232bot)
         try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
+        except FloodWaitError as fwe:
+            await asyncio.sleep(fwe.seconds + 2)
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
         except Exception:
             pass
@@ -93,76 +117,63 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
                 edit_messages=True,
                 delete_messages=True
             )
+        except FloodWaitError as fwe:
+            await asyncio.sleep(fwe.seconds + 2)
+            await client.edit_admin(
+                entity=channel, user=b2, post_messages=True,
+                edit_messages=True, delete_messages=True
+            )
         except Exception as e:
-            logger.error(f"Error promoting Bot 2: {e}")
+            logger.warning(f"Notice regarding Bot 2 promotion: {e}")
 
-        # 3. Create a forum topic in the target group named after the source channel title
+        # 3. Create a forum topic in the target group
         thread_id = None
         try:
-            result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
-                peer=target_group_id,
+            result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
+                channel=target_group_id,
                 title=channel_title
             ))
             for update in result.updates:
                 if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
                     thread_id = update.id
                     break
+        except FloodWaitError as fwe:
+            await asyncio.sleep(fwe.seconds + 2)
         except Exception as e:
             logger.error(f"Failed to create forum topic via Telethon: {e}")
 
-        return channel.id, thread_id
+        return channel, thread_id
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /start command."""
-    await update.message.reply_text(
-        "👋 Welcome! I am your automated forwarding and management bot.\n\n"
-        "Commands:\n"
-        "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Setup bots, create a forum topic, and forward messages",
-        parse_mode="Markdown"
-    )
+async def process_forwarding_task(task_data):
+    """Processes a single task from the queue with FloodWait protection and real-time updates."""
+    update = task_data['update']
+    source_channel_str = task_data['source_channel_str']
+    reverse_order = task_data['reverse_order']
+    status_msg = task_data['status_msg']
 
-
-async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /add_session command to initiate writing a session string."""
-    await update.message.reply_text(
-        "🔑 Please send your **Telethon Session String** in the next message:",
-        parse_mode="Markdown"
-    )
-    context.user_data['step'] = 'waiting_session_string'
-
-
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /send command utilizing pre-defined bots and queue processing."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
-    if not session_to_use:
-        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
-        return
-
-    source_channel_str = args[0]
-    reverse_order = len(args) > 1 and args[1].lower() == 'r'
-
-    status_msg = await update.message.reply_text("⚙️ Setting up bots (@Dps_storiesbot & @Testdp112232bot), creating forum topic, and indexing files...")
 
     try:
-        source_chat_id, message_thread_id = await setup_bots_and_topic_telethon(source_channel_str, TARGET_GROUP_ID)
+        await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
+        channel_entity, message_thread_id = await setup_bots_and_topic_telethon(source_channel_str, TARGET_GROUP_ID)
     except Exception as e:
         await status_msg.edit_text(f"❌ Setup failed: {e}")
         return
 
-    # Fetch message IDs using Telethon client
+    # Fetch message IDs using Telethon client with FloodWait protection
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
     message_ids = []
+    
     async with client:
-        channel_entity = await client.get_entity(source_chat_id)
-        async for message in client.iter_messages(channel_entity):
-            message_ids.append(message.id)
+        try:
+            async for message in client.iter_messages(channel_entity):
+                message_ids.append(message.id)
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait during iteration: sleeping for {fwe.seconds}s")
+            await asyncio.sleep(fwe.seconds + 2)
+            async for message in client.iter_messages(channel_entity):
+                message_ids.append(message.id)
 
     if reverse_order:
         message_ids.reverse()
@@ -182,21 +193,39 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown"
     )
 
-    bot = context.bot
+    bot = update.get_bot()
     for idx, msg_id in enumerate(message_ids, start=1):
-        try:
-            kwargs = {
-                "chat_id": TARGET_GROUP_ID,
-                "from_chat_id": source_chat_id,
-                "message_id": msg_id
-            }
-            if message_thread_id:
-                kwargs["message_thread_id"] = message_thread_id
+        success = False
+        retries = 3
+        while retries > 0 and not success:
+            try:
+                kwargs = {
+                    "chat_id": TARGET_GROUP_ID,
+                    "from_chat_id": channel_entity.id,
+                    "message_id": msg_id
+                }
+                if message_thread_id:
+                    kwargs["message_thread_id"] = message_thread_id
 
-            await bot.copy_message(**kwargs)
-            forwarded_files += 1
-        except Exception as err:
-            logger.error(f"Error forwarding message {msg_id}: {err}")
+                await bot.copy_message(**kwargs)
+                forwarded_files += 1
+                success = True
+            except Exception as err:
+                # Check for Telegram Bot API FloodWait or rate limit error strings
+                err_str = str(err).lower()
+                if "flood" in err_str or "retry after" in err_str:
+                    import re
+                    match = re.search(r"retry after (\d+)", err_str)
+                    sleep_time = int(match.group(1)) if match else 15
+                    logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
+                    await asyncio.sleep(sleep_time + 2)
+                    retries -= 1
+                else:
+                    logger.error(f"Error forwarding message {msg_id}: {err}")
+                    error_files += 1
+                    break
+
+        if not success and not error_files:
             error_files += 1
 
         if idx % 5 == 0 or idx == total_files:
@@ -229,8 +258,73 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def task_worker():
+    """Background worker that pulls tasks sequentially from the queue."""
+    while True:
+        task_data = await task_queue.get()
+        try:
+            await process_forwarding_task(task_data)
+        except Exception as e:
+            logger.error(f"Error in task worker queue: {e}")
+        finally:
+            task_queue.task_done()
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /start command."""
+    await update.message.reply_text(
+        "👋 Welcome! I am your automated forwarding and management bot with Quest Queue support.\n\n"
+        "Commands:\n"
+        "• `/add_session` - Save your Telethon session string\n"
+        "• `/send {channel_id} [r]` - Add forwarding task to the quest queue",
+        parse_mode="Markdown"
+    )
+
+
+async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /add_session command."""
+    await update.message.reply_text(
+        "🔑 Please send your **Telethon Session String** in the next message:",
+        parse_mode="Markdown"
+    )
+    context.user_data['step'] = 'waiting_session_string'
+
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /send command by adding tasks into the sequential quest queue."""
+    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
+    if not session_to_use:
+        await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
+        return
+
+    source_channel_str = args[0]
+    reverse_order = len(args) > 1 and args[1].lower() == 'r'
+
+    queue_position = task_queue.qsize() + 1
+    status_msg = await update.message.reply_text(
+        f"📋 Task added to Quest Queue!\n"
+        f"📌 Position in Queue: `{queue_position}`\n"
+        f"⏳ Waiting for previous tasks to finish...",
+        parse_mode="Markdown"
+    )
+
+    task_data = {
+        'update': update,
+        'source_channel_str': source_channel_str,
+        'reverse_order': reverse_order,
+        'status_msg': status_msg
+    }
+
+    await task_queue.put(task_data)
+
+
 async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manages multi-step conversational input specifically for session configuration."""
+    """Manages multi-step conversational input."""
     global RUNTIME_SESSION_STRING
     user_data = context.user_data
     step = user_data.get('step')
@@ -267,6 +361,10 @@ async def run_bot():
     
     await application.initialize()
     await application.start()
+    
+    # Start background task worker loop for sequential quest execution
+    asyncio.create_task(task_worker())
+    
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     
     stop_event = asyncio.Event()
