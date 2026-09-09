@@ -130,8 +130,8 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
     thread_id = None
     while True:
         try:
-            result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
-                channel=target_group_id,
+            result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
+                peer=target_group_id,
                 title=channel_title
             ))
             for update in result.updates:
@@ -150,11 +150,10 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task with error analysis, notification, and cancellation support."""
+    """Processes a single task securely using Telethon userbot session to bypass private channel blocks."""
     global current_task_cancel_event
     current_task_cancel_event.clear()
 
-    update = task_data['update']
     status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
     reverse_order = task_data['reverse_order']
@@ -167,7 +166,7 @@ async def process_forwarding_task(task_data):
             await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
             channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
         except Exception as e:
-            error_reason = f"Setup failed due to exception: `{type(e).__name__}: {str(e)}`"
+            error_reason = f"Setup failed: `{type(e).__name__}: {str(e)}`"
             logger.error(error_reason)
             await status_msg.edit_text(f"❌ **Task Failed & Cancelled**\n\nReason: {error_reason}", parse_mode="Markdown")
             return
@@ -209,7 +208,12 @@ async def process_forwarding_task(task_data):
             parse_mode="Markdown"
         )
 
-        bot = update.get_bot()
+        try:
+            target_entity = await client.get_entity(TARGET_GROUP_ID)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to resolve target group: {e}")
+            return
+
         for idx, msg_id in enumerate(message_ids, start=1):
             if current_task_cancel_event.is_set():
                 await status_msg.edit_text(
@@ -221,37 +225,24 @@ async def process_forwarding_task(task_data):
                 return
 
             success = False
-            retries = 3
-            while retries > 0 and not success:
+            while not success:
                 try:
-                    kwargs = {
-                        "chat_id": TARGET_GROUP_ID,
-                        "from_chat_id": channel_entity.id,
-                        "message_id": msg_id
-                    }
-                    if message_thread_id:
-                        kwargs["message_thread_id"] = int(message_thread_id)
-
-                    await bot.copy_message(**kwargs)
+                    await client.forward_messages(
+                        entity=target_entity,
+                        messages=msg_id,
+                        from_peer=channel_entity,
+                        reply_to=int(message_thread_id) if message_thread_id else None
+                    )
                     forwarded_files += 1
                     success = True
+                except FloodWaitError as fwe:
+                    logger.warning(f"Telethon FloodWait during forwarding: sleeping for {fwe.seconds} seconds")
+                    await asyncio.sleep(fwe.seconds + 2)
                 except Exception as err:
-                    err_str = str(err).lower()
-                    if "flood" in err_str or "retry after" in err_str:
-                        import re
-                        match = re.search(r"retry after (\d+)", err_str)
-                        sleep_time = int(match.group(1)) if match else 15
-                        logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
-                        await asyncio.sleep(sleep_time + 2)
-                        retries -= 1
-                    else:
-                        last_error_reason = f"`{type(err).__name__}: {str(err)}`"
-                        logger.error(f"Error copying message {msg_id}: {err}")
-                        error_files += 1
-                        break
-
-            if not success and retries == 0 and not error_files:
-                error_files += 1
+                    last_error_reason = f"`{type(err).__name__}: {str(err)}`"
+                    logger.error(f"Error forwarding message {msg_id}: {err}")
+                    error_files += 1
+                    break
 
             if idx % 5 == 0 or idx == total_files:
                 elapsed = time.time() - start_time
@@ -324,7 +315,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     global current_task_cancel_event
     current_task_cancel_event.set()
 
-    # Clear pending queue items
     cleared_count = 0
     while not task_queue.empty():
         try:
@@ -366,7 +356,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     task_data = {
-        'update': update,
         'source_channel_str': source_channel_str,
         'reverse_order': reverse_order,
         'status_msg': status_msg
