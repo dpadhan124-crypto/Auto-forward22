@@ -20,9 +20,9 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TARGET_GROUP_ID = -1004440356312
 
-# Pre-defined bot configuration based on your requirements
-BOT_1_USERNAME = "Dps_storiesbot"  # Full permissions including Stories & Admins
-BOT_2_USERNAME = "Testdp112232bot"  # Forwarder/message copying bot
+# Pre-defined bot configuration
+BOT_1_USERNAME = "Dps_storiesbot"   # Full permissions including Stories & Admins
+BOT_2_USERNAME = "Testdp112232bot"  # Forwarder / message copying bot
 
 # Runtime storage for session string if added via command
 RUNTIME_SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -52,7 +52,7 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
         b1 = BOT_1_USERNAME.strip().replace("@", "")
         b2 = BOT_2_USERNAME.strip().replace("@", "")
 
-        # 1. Invite and promote Bot 1 (Dps_storiesbot - All Permissions including Stories & Admins)
+        # 1. Invite and promote Bot 1 (Dps_storiesbot)
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
         except Exception:
@@ -68,7 +68,7 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
             post_stories=True, edit_stories=True, delete_stories=True
         )
 
-        # 2. Invite and promote Bot 2 (Testdp112232bot - Read, Post, Edit, Delete permissions)
+        # 2. Invite and promote Bot 2 (Testdp112232bot)
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
         except Exception:
@@ -83,29 +83,18 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
         )
 
         # 3. Create a forum topic in the target group named after the source channel title
-        topic_title = f"{channel_title}"
+        thread_id = None
         try:
             result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
                 peer=target_group_id,
-                title=topic_title
+                title=channel_title
             ))
-            # Extract thread ID (message_thread_id) from the created topic
-            thread_id = None
-            for action in result.updates:
-                if isinstance(action, telethon.tl.types.UpdateChannel) or hasattr(action, 'id'):
-                    pass
-            # Alternatively look for message ID of the service message or use standard attribute
-            thread_id = result.updates[1].id if len(result.updates) > 1 and hasattr(result.updates[1], 'id') else getattr(result, 'id', None)
-            
-            # Robust extraction of forum topic ID from updates
             for update in result.updates:
                 if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
-                    # The message ID of the topic creation service message serves as the topic's thread ID
                     thread_id = update.id
                     break
         except Exception as e:
             logger.error(f"Failed to create forum topic via Telethon: {e}")
-            thread_id = None
 
         return channel.id, thread_id
 
@@ -120,7 +109,7 @@ async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /send command automatically utilizing pre-defined bots and queue processing."""
+    """Handles /send command utilizing pre-defined bots and queue processing."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     if not session_to_use:
         await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
@@ -134,7 +123,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     source_channel_str = args[0]
     reverse_order = len(args) > 1 and args[1].lower() == 'r'
 
-    status_msg = await update.message.reply_text("⚙️ Adding bots (@Dps_storiesbot & @Testdp112232bot) to channel, creating forum topic, and indexing files...")
+    status_msg = await update.message.reply_text("⚙️ Setting up bots (@Dps_storiesbot & @Testdp112232bot), creating forum topic, and indexing files...")
 
     try:
         source_chat_id, message_thread_id = await setup_bots_and_topic_telethon(source_channel_str, TARGET_GROUP_ID)
@@ -171,7 +160,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bot = context.bot
     for idx, msg_id in enumerate(message_ids, start=1):
         try:
-            # Copy message to specific forum topic thread inside target group if available
             kwargs = {
                 "chat_id": TARGET_GROUP_ID,
                 "from_chat_id": source_chat_id,
@@ -212,7 +200,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"✅ Forwarded: {forwarded_files}\n"
         f"❌ Errors: {error_files}\n"
         f"⏱️ Total Time: {int(time.time() - start_time)}s",
-        parse_mode="Markdown"
+        parse_Mode="Markdown"
     )
 
 
@@ -229,13 +217,25 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
 
-def main() -> None:
+async def run_bot():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    stop_event = asyncio.Event()
+    await stop_event.wait()
+
+
+def main() -> None:
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
