@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+os.environ.get("PORT", 10000)
 
 # Default persistent configurations (can be updated via /settings)
 CONFIG = {
