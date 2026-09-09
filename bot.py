@@ -10,6 +10,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 import telethon.tl.functions.channels
 import telethon.tl.functions.messages
+from telethon.tl.types import ChatAdminRights
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -23,7 +24,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TARGET_GROUP_ID = -1004440356312
 
 # Pre-defined bot configuration
-BOT_1_USERNAME = "Dps_storiesbot"   # Full permissions including Stories & Admins
+BOT_1_USERNAME = "Dps_storiesbot"   # Full administrative permissions
 BOT_2_USERNAME = "Testdp112232bot"  # Forwarder / message copying bot
 
 # Runtime storage for session string if added via command
@@ -39,7 +40,7 @@ def generate_progress_bar(completed, total):
 
 
 async def setup_bots_and_topic_telethon(channel_input, target_group_id):
-    """Promotes predefined bots, fetches channel title, and creates a forum topic in the target group."""
+    """Promotes predefined bots using raw/compatible ChatAdminRights, fetches channel title, and creates a forum topic."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
     
@@ -54,35 +55,46 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
         b1 = BOT_1_USERNAME.strip().replace("@", "")
         b2 = BOT_2_USERNAME.strip().replace("@", "")
 
-        # 1. Invite and promote Bot 1 (Dps_storiesbot)
+        # 1. Invite and promote Bot 1 (Dps_storiesbot with maximum standard admin rights)
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
         except Exception:
             pass
         
-        await client.edit_admin(
-            entity=channel,
-            user=b1,
-            change_info=True, post_messages=True, edit_messages=True,
-            delete_messages=True, ban_users=True, invite_users=True,
-            pin_messages=True, add_admins=True, anonymous=False,
-            manage_call=True, 
-            post_stories=True, edit_stories=True, delete_stories=True
-        )
+        try:
+            await client.edit_admin(
+                entity=channel,
+                user=b1,
+                change_info=True, 
+                post_messages=True, 
+                edit_messages=True,
+                delete_messages=True, 
+                ban_users=True, 
+                invite_users=True,
+                pin_messages=True, 
+                add_admins=True, 
+                anonymous=False,
+                manage_call=True
+            )
+        except Exception as e:
+            logger.error(f"Error promoting Bot 1: {e}")
 
-        # 2. Invite and promote Bot 2 (Testdp112232bot)
+        # 2. Invite and promote Bot 2 (Testdp112232bot with standard forwarding/posting permissions)
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
         except Exception:
             pass
 
-        await client.edit_admin(
-            entity=channel,
-            user=b2,
-            post_messages=True,
-            edit_messages=True,
-            delete_messages=True
-        )
+        try:
+            await client.edit_admin(
+                entity=channel,
+                user=b2,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True
+            )
+        except Exception as e:
+            logger.error(f"Error promoting Bot 2: {e}")
 
         # 3. Create a forum topic in the target group named after the source channel title
         thread_id = None
