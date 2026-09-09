@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -35,6 +36,13 @@ if __name__ == "__main__":
 
     # Register the /start command handler
     app.add_handler(CommandHandler("start", start))
+
+    # Explicitly manage the event loop for Python 3.14+ compatibility
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     # Render requires binding to a web port using webhooks to prevent 'No open ports detected' errors
     if RENDER_EXTERNAL_URL:
