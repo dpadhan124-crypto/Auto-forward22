@@ -2,6 +2,8 @@ import logging
 import asyncio
 import time
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
 from telethon import TelegramClient
@@ -97,6 +99,17 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
             logger.error(f"Failed to create forum topic via Telethon: {e}")
 
         return channel.id, thread_id
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /start command."""
+    await update.message.reply_text(
+        "👋 Welcome! I am your automated forwarding and management bot.\n\n"
+        "Commands:\n"
+        "• `/add_session` - Save your Telethon session string\n"
+        "• `/send {channel_id} [r]` - Setup bots, create a forum topic, and forward messages",
+        parse_mode="Markdown"
+    )
 
 
 async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -200,7 +213,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"✅ Forwarded: {forwarded_files}\n"
         f"❌ Errors: {error_files}\n"
         f"⏱️ Total Time: {int(time.time() - start_time)}s",
-        parse_Mode="Markdown"
+        parse_mode="Markdown"
     )
 
 
@@ -217,8 +230,25 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+
 async def run_bot():
+    # Start the HTTP server to satisfy Render's port binding requirements
+    threading.Thread(target=run_http_server, daemon=True).start()
+
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
