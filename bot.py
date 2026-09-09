@@ -27,9 +27,10 @@ TARGET_GROUP_ID = -1004440356312
 BOT_1_USERNAME = "Dps_storiesbot"   # Full administrative permissions
 BOT_2_USERNAME = "Testdp112232bot"  # Forwarder / message copying bot
 
-# Runtime storage for session string and task queue
+# Runtime storage for session string, task queue, and cancellation tracking
 RUNTIME_SESSION_STRING = os.environ.get("SESSION_STRING", "")
 task_queue = asyncio.Queue()
+current_task_cancel_event = asyncio.Event()
 
 
 def generate_progress_bar(completed, total):
@@ -149,7 +150,10 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task using Telethon to index/setup, and bot.copy_message for delivery."""
+    """Processes a single task with error analysis, notification, and cancellation support."""
+    global current_task_cancel_event
+    current_task_cancel_event.clear()
+
     update = task_data['update']
     status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
@@ -163,11 +167,16 @@ async def process_forwarding_task(task_data):
             await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
             channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
         except Exception as e:
-            await status_msg.edit_text(f"❌ Setup failed: {e}")
+            error_reason = f"Setup failed due to exception: `{type(e).__name__}: {str(e)}`"
+            logger.error(error_reason)
+            await status_msg.edit_text(f"❌ **Task Failed & Cancelled**\n\nReason: {error_reason}", parse_mode="Markdown")
             return
 
         message_ids = []
         while True:
+            if current_task_cancel_event.is_set():
+                await status_msg.edit_text("🛑 **Task Cancelled by User** during file indexing.", parse_mode="Markdown")
+                return
             try:
                 async for message in client.iter_messages(channel_entity):
                     message_ids.append(message.id)
@@ -176,8 +185,10 @@ async def process_forwarding_task(task_data):
                 logger.warning(f"FloodWait during iteration: sleeping for {fwe.seconds} seconds")
                 await asyncio.sleep(fwe.seconds + 2)
             except Exception as e:
-                logger.error(f"Error fetching messages: {e}")
-                break
+                error_reason = f"Failed to iterate channel messages: `{type(e).__name__}: {str(e)}`"
+                logger.error(error_reason)
+                await status_msg.edit_text(f"❌ **Task Failed**\n\nReason: {error_reason}", parse_mode="Markdown")
+                return
 
         if reverse_order:
             message_ids.reverse()
@@ -185,6 +196,7 @@ async def process_forwarding_task(task_data):
         total_files = len(message_ids)
         forwarded_files = 0
         error_files = 0
+        last_error_reason = "None"
         start_time = time.time()
 
         await status_msg.edit_text(
@@ -199,6 +211,15 @@ async def process_forwarding_task(task_data):
 
         bot = update.get_bot()
         for idx, msg_id in enumerate(message_ids, start=1):
+            if current_task_cancel_event.is_set():
+                await status_msg.edit_text(
+                    f"🛑 **Task Cancelled by User**\n\n"
+                    f"📊 Progress: {generate_progress_bar(idx, total_files)}\n"
+                    f"✅ Forwarded: {forwarded_files} | ❌ Errors: {error_files}",
+                    parse_mode="Markdown"
+                )
+                return
+
             success = False
             retries = 3
             while retries > 0 and not success:
@@ -224,6 +245,7 @@ async def process_forwarding_task(task_data):
                         await asyncio.sleep(sleep_time + 2)
                         retries -= 1
                     else:
+                        last_error_reason = f"`{type(err).__name__}: {str(err)}`"
                         logger.error(f"Error copying message {msg_id}: {err}")
                         error_files += 1
                         break
@@ -250,15 +272,18 @@ async def process_forwarding_task(task_data):
                 except Exception:
                     pass
 
-        await status_msg.edit_text(
+        summary_text = (
             f"✨ **Forwarding Task Completed!**\n\n"
             f"📊 Progress: [██████████] 100%\n"
             f"📁 Total Files: {total_files}\n"
             f"✅ Forwarded: {forwarded_files}\n"
             f"❌ Errors: {error_files}\n"
-            f"⏱️ Total Time: {int(time.time() - start_time)}s",
-            parse_mode="Markdown"
+            f"⏱️ Total Time: {int(time.time() - start_time)}s"
         )
+        if error_files > 0:
+            summary_text += f"\n\n⚠️ **Last Formed Error Detected:**\n{last_error_reason}"
+
+        await status_msg.edit_text(summary_text, parse_mode="Markdown")
 
 
 async def task_worker():
@@ -276,10 +301,11 @@ async def task_worker():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles /start command."""
     await update.message.reply_text(
-        "👋 Welcome! I am your automated forwarding and management bot with Quest Queue support.\n\n"
+        "👋 Welcome! I am your automated forwarding and management bot with Quest Queue & Error Diagnostics.\n\n"
         "Commands:\n"
         "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Add forwarding task safely into the quest queue",
+        "• `/send {channel_id} [r]` - Add forwarding task to queue\n"
+        "• `/cancel` - Cancel active process and clear remaining queue",
         parse_mode="Markdown"
     )
 
@@ -291,6 +317,29 @@ async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
     context.user_data['step'] = 'waiting_session_string'
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /cancel command to abort active processing and empty the pending queue."""
+    global current_task_cancel_event
+    current_task_cancel_event.set()
+
+    # Clear pending queue items
+    cleared_count = 0
+    while not task_queue.empty():
+        try:
+            task_queue.get_nowait()
+            task_queue.task_done()
+            cleared_count += 1
+        except Exception:
+            break
+
+    await update.message.reply_text(
+        f"🛑 **Cancellation Triggered!**\n"
+        f"• Active process aborted.\n"
+        f"• Cleared `{cleared_count}` pending tasks from the quest queue.",
+        parse_mode="Markdown"
+    )
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -359,6 +408,7 @@ async def run_bot():
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
     
