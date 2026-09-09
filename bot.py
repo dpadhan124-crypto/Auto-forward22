@@ -1,218 +1,197 @@
-import os
-import asyncio
 import logging
-from aiohttp import web
-from telethon import TelegramClient, events, Button
+import asyncio
+import time
+import os
+from telegram import Update
+from telegram.ext import Application, ContextTypes, CommandHandler, filters
+from telethon import TelegramClient
 from telethon.sessions import StringSession
+import telethon.tl.functions.channels
 
-# Setup Comprehensive Logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Environment Configuration
+# --- CONFIGURATION (Render Environment Safe) ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-PORT = int(os.environ.get("PORT", 8080))
+TARGET_GROUP_ID = -1004440356312
 
-# Initialize Telethon Bot Client
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Global dynamic user client instance
-user = None
+def generate_progress_bar(completed, total):
+    """Generates a visual progress bar string."""
+    percentage = (completed / total) if total > 0 else 0
+    filled = int(round(10 * percentage))
+    bar = "█" * filled + "░" * (10 - filled)
+    return f"[{bar}] {int(percentage * 100)}%"
 
-# In-memory State Configuration
-config = {
-    "order": "old_to_new",
-    "remove_sender": False,
-    "remove_caption": False,
-    "backup_group": None
-}
+async def promote_bots_telethon(channel_input, bot1_username, bot2_username):
+    """Promotes both specified bot usernames with respective permission levels using Telethon."""
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    async with client:
+        if channel_input.startswith("-") or channel_input.isdigit():
+            channel_input = int(channel_input)
 
-def get_settings_ui():
-    return [
-        [Button.inline(f"🔄 Order: {'Old -> New' if config['order'] == 'old_to_new' else 'New -> Old'}", b"toggle_order")],
-        [Button.inline(f"👤 Remove Sender: {'YES (Copy)' if config['remove_sender'] else 'NO (Forward)'}", b"toggle_sender")],
-        [Button.inline(f"📝 Caption: {'Removed' if config['remove_caption'] else 'Original'}", b"toggle_caption")]
-    ]
+        channel = await client.get_entity(channel_input)
 
-@bot.on(events.NewMessage(incoming=True))
-async def log_incoming_messages(event):
-    chat = await event.get_chat()
-    logger.info(f"Received update from chat {chat.id}: {event.text or '[Media/Other]'}")
+        # Clean usernames
+        b1 = bot1_username.strip().replace("@", "")
+        b2 = bot2_username.strip().replace("@", "")
 
-@bot.on(events.NewMessage(pattern='/start'))
-async def cmd_start(event):
-    logger.info("Executing /start command handler.")
-    try:
-        bot_me = await bot.get_me()
-        add_link = f"https://t.me/{bot_me.username}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins"
+        # 1. Invite and promote Bot 1 (All Permissions including Stories & Admins)
+        try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
+        except Exception:
+            pass
         
-        await event.reply(
-            "**Forwarding & Backup Controller (Telethon)**\n\n"
-            "1. Use `/login <telethon_string_session>` to connect your user session.\n"
-            "2. Use `/setbackup <group_id>` to specify your backup group.\n"
-            "3. Configure your settings via `/settings`.",
-            buttons=[[Button.url("➕ Add to Channel / Group", add_link)]]
+        await client.edit_admin(
+            entity=channel,
+            user=b1,
+            change_info=True, post_messages=True, edit_messages=True,
+            delete_messages=True, ban_users=True, invite_users=True,
+            pin_messages=True, add_admins=True, anonymous=False,
+            manage_call=True, manage_topics=True, 
+            post_stories=True, edit_stories=True, delete_stories=True
         )
-        logger.info("/start response sent successfully.")
-    except Exception as e:
-        logger.error(f"Error handling /start command: {e}", exc_info=True)
 
-@bot.on(events.NewMessage(pattern='/login'))
-async def cmd_login(event):
-    global user
-    logger.info("Executing /login command handler.")
-    args = event.raw_text.split(maxsplit=1)
-    if len(args) < 2:
-        return await event.reply("Usage: `/login <telethon_string_session>`")
+        # 2. Invite and promote Bot 2 (Read, Post, Edit, Delete permissions)
+        try:
+            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
+        except Exception:
+            pass
+
+        await client.edit_admin(
+            entity=channel,
+            user=b2,
+            post_messages=True,
+            edit_messages=True,
+            delete_messages=True
+        )
+
+        return channel.id
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /send command, asks for the 2 bot usernames interactively via chat, and processes queue."""
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: `/send {source_channel_id} [r]`", parse_mode="Markdown")
+        return
+
+    source_channel_str = args[0]
+    reverse_order = len(args) > 1 and args[1].lower() == 'r'
+
+    await update.message.reply_text("🤖 Please send the **Username of Bot 1** (Full Permissions):", parse_mode="Markdown")
     
-    session_str = args[1]
-    status = await event.reply("🔄 Verifying Telethon string session...")
-    try:
-        if user and user.is_connected():
-            await user.disconnect()
+    # Simple Conversation flow helper using context user data
+    context.user_data['step'] = 'waiting_bot1'
+    context.user_data['source_channel'] = source_channel_str
+    context.user_data['reverse'] = reverse_order
+
+async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manages multi-step conversational input for bot usernames required on Render."""
+    user_data = context.user_data
+    step = user_data.get('step')
+
+    if step == 'waiting_bot1':
+        user_data['bot1'] = update.message.text
+        user_data['step'] = 'waiting_bot2'
+        await update.message.reply_text("🤖 Got it. Now send the **Username of Bot 2** (Forwarder):", parse_mode="Markdown")
+        return
+
+    elif step == 'waiting_bot2':
+        user_data['bot2'] = update.message.text
+        user_data['step'] = None
         
-        user = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await user.connect()
-        
-        if not await user.is_user_authorized():
-            await status.edit("❌ Login failed: Session string is unauthorized or expired.")
-            user = None
+        channel_str = user_data.get('source_channel')
+        reverse_order = user_data.get('reverse')
+        bot1 = user_data.get('bot1')
+        bot2 = update.message.text
+
+        status_msg = await update.message.reply_text("⚙️ Promoting bots via userbot and indexing files...")
+
+        try:
+            source_chat_id = await promote_bots_telethon(channel_str, bot1, bot2)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to promote bots: {e}")
             return
 
-        me = await user.get_me()
-        await status.edit(f"✅ Successfully logged in as `{me.first_name}` (`{me.id}`) via Telethon!")
-        logger.info(f"User session successfully authenticated for ID {me.id}")
-    except Exception as e:
-        logger.error(f"Failed to login user session: {e}", exc_info=True)
-        user = None
-        await status.edit(f"❌ Login failed: {e}")
+        # Fetch message IDs
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        message_ids = []
+        async with client:
+            channel_entity = await client.get_entity(source_chat_id)
+            async for message in client.iter_messages(channel_entity):
+                message_ids.append(message.id)
 
-@bot.on(events.NewMessage(pattern='/settings'))
-async def cmd_settings(event):
-    logger.info("Executing /settings command handler.")
-    try:
-        await event.reply("**⚙️ Configuration Settings**", buttons=get_settings_ui())
-    except Exception as e:
-        logger.error(f"Error in /settings: {e}", exc_info=True)
+        if reverse_order:
+            message_ids.reverse()
 
-@bot.on(events.CallbackQuery(data=b"toggle_order"))
-async def toggle_order(event):
-    config["order"] = "new_to_old" if config["order"] == "old_to_new" else "old_to_new"
-    await event.edit(buttons=get_settings_ui())
-    await event.answer("Order updated!")
+        total_files = len(message_ids)
+        forwarded_files = 0
+        error_files = 0
+        start_time = time.time()
 
-@bot.on(events.CallbackQuery(data=b"toggle_sender"))
-async def toggle_sender(event):
-    config["remove_sender"] = not config["remove_sender"]
-    await event.edit(buttons=get_settings_ui())
-    await event.answer("Sender setting updated!")
+        await status_msg.edit_text(
+            f"🚀 **Forwarding Task Started**\n\n"
+            f"📊 Progress: [░░░░░░░░░░] 0%\n"
+            f"📁 Total Files: {total_files}\n"
+            f"✅ Forwarded: 0\n"
+            f"❌ Errors: 0\n"
+            f"⏳ Remaining Time: Calculating...",
+            parse_mode="Markdown"
+        )
 
-@bot.on(events.CallbackQuery(data=b"toggle_caption"))
-async def toggle_caption(event):
-    config["remove_caption"] = not config["remove_caption"]
-    await event.edit(buttons=get_settings_ui())
-    await event.answer("Caption setting updated!")
-
-@bot.on(events.NewMessage(pattern='/setbackup'))
-async def cmd_set_backup(event):
-    logger.info("Executing /setbackup command handler.")
-    args = event.raw_text.split(maxsplit=1)
-    if len(args) < 2:
-        return await event.reply("Usage: `/setbackup <group_id>`")
-    try:
-        config["backup_group"] = int(args[1])
-        await event.reply(f"✅ Backup group set to: `{config['backup_group']}`")
-    except ValueError:
-        logger.error("Invalid group ID provided for backup.")
-        await event.reply("❌ Invalid group ID. Must be an integer.")
-
-@bot.on(events.NewMessage(pattern='/backup'))
-async def cmd_backup(event):
-    logger.info("Executing /backup command handler.")
-    if not user or not user.is_connected():
-        return await event.reply("⚠️ **User Session Required:** Send `/login <string_session>` to the bot first.")
-    if not config["backup_group"]:
-        return await event.reply("⚠️ **Target Missing:** Use `/setbackup <group_id>` first.")
-        
-    args = event.raw_text.split()
-    if len(args) < 2:
-        return await event.reply("Usage: `/backup <channel_id>`")
-        
-    try:
-        source_chat = int(args[1])
-    except ValueError:
-        return await event.reply("Usage: `/backup <channel_id>` (ID must be integer or username)")
-
-    status = await event.reply("🔄 Initializing Telethon backup process...")
-    try:
-        chat_info = await user.get_entity(source_chat)
-        # Create forum topic if the backup group is a forum
-        try:
-            topic = await user.create_forum_topic(config["backup_group"], title=f"{getattr(chat_info, 'title', 'Backup')} Backup")
-            topic_id = topic.id
-        except Exception:
-            topic_id = None # Fallback if target group is not a forum
-            
-        await status.edit("📥 Indexing messages...")
-        messages = []
-        async for msg in user.iter_messages(source_chat):
-            messages.append(msg)
-            
-        if config["order"] == "old_to_new":
-            messages.reverse()
-            
-        await status.edit(f"🚀 Processing {len(messages)} messages...")
-        
-        for msg in messages:
+        bot = context.bot
+        for idx, msg_id in enumerate(message_ids, start=1):
             try:
-                caption = None if config["remove_caption"] else msg.text
-                if config["remove_sender"]:
-                    await user.send_message(
-                        config["backup_group"],
-                        message=msg.media or msg.text,
-                        file=msg.media,
-                        formatting_entities=msg.entities,
-                        reply_to=topic_id
+                await bot.copy_message(
+                    chat_id=TARGET_GROUP_ID,
+                    from_chat_id=source_chat_id,
+                    message_id=msg_id
+                )
+                forwarded_files += 1
+            except Exception as err:
+                logger.error(f"Error forwarding message {msg_id}: {err}")
+                error_files += 1
+
+            if idx % 5 == 0 or idx == total_files:
+                elapsed = time.time() - start_time
+                avg_time = elapsed / idx if idx > 0 else 0
+                eta = int(avg_time * (total_files - idx))
+                eta_str = f"{eta // 60}m {eta % 60}s" if eta > 60 else f"{eta}s"
+
+                try:
+                    await status_msg.edit_text(
+                        f"🚀 **Forwarding Task in Progress**\n\n"
+                        f"📊 Progress: {generate_progress_bar(idx, total_files)}\n"
+                        f"📁 Total Files: {total_files}\n"
+                        f"✅ Forwarded: {forwarded_files}\n"
+                        f"❌ Errors: {error_files}\n"
+                        f"⏳ Remaining Time: {eta_str}",
+                        parse_mode="Markdown"
                     )
-                else:
-                    await user.forward_messages(config["backup_group"], messages=msg, reply_to=topic_id)
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning(f"Skipped msg: {e}")
-                
-        await status.edit("✅ Backup complete.")
-    except Exception as e:
-        logger.error(f"Error during backup process: {e}", exc_info=True)
-        await status.edit(f"❌ Error during backup: {str(e)}")
+                except Exception:
+                    pass
 
-# Render Web Service Keep-Alive
-async def web_server():
-    app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"Web server started on port {PORT}")
+        await status_msg.edit_text(
+            f"✨ **Forwarding Task Completed!**\n\n"
+            f"📊 Progress: [██████████] 100%\n"
+            f"📁 Total Files: {total_files}\n"
+            f"✅ Forwarded: {forwarded_files}\n"
+            f"❌ Errors: {error_files}\n"
+            f"⏱️ Total Time: {int(time.time() - start_time)}s",
+            parse_mode="Markdown"
+        )
 
-async def main():
-    logger.info("Starting application services...")
-    server_task = asyncio.create_task(web_server())
+def main() -> None:
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_flow))
     
-    logger.info("Bot client running via Telethon event loop.")
-    await bot.run_until_disconnected()
-    
-    if user and user.is_connected():
-        await user.disconnect()
-    server_task.cancel()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped manually by user.")
+    main()
