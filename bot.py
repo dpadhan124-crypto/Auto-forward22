@@ -149,7 +149,8 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task using Telethon userbot session with robust native FloodWait looping."""
+    """Processes a single task using Telethon to index/setup, and bot.copy_message for delivery."""
+    update = task_data['update']
     status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
     reverse_order = task_data['reverse_order']
@@ -196,31 +197,39 @@ async def process_forwarding_task(task_data):
             parse_mode="Markdown"
         )
 
-        try:
-            target_entity = await client.get_entity(TARGET_GROUP_ID)
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Failed to resolve target group: {e}")
-            return
-
+        bot = update.get_bot()
         for idx, msg_id in enumerate(message_ids, start=1):
             success = False
-            while not success:
+            retries = 3
+            while retries > 0 and not success:
                 try:
-                    await client.forward_messages(
-                        entity=target_entity,
-                        messages=msg_id,
-                        from_peer=channel_entity,
-                        reply_to=message_thread_id
-                    )
+                    kwargs = {
+                        "chat_id": TARGET_GROUP_ID,
+                        "from_chat_id": channel_entity.id,
+                        "message_id": msg_id
+                    }
+                    if message_thread_id:
+                        kwargs["message_thread_id"] = int(message_thread_id)
+
+                    await bot.copy_message(**kwargs)
                     forwarded_files += 1
                     success = True
-                except FloodWaitError as fwe:
-                    logger.warning(f"Telethon FloodWait during forwarding: sleeping for {fwe.seconds} seconds")
-                    await asyncio.sleep(fwe.seconds + 2)
                 except Exception as err:
-                    logger.error(f"Error forwarding message {msg_id}: {err}")
-                    error_files += 1
-                    break
+                    err_str = str(err).lower()
+                    if "flood" in err_str or "retry after" in err_str:
+                        import re
+                        match = re.search(r"retry after (\d+)", err_str)
+                        sleep_time = int(match.group(1)) if match else 15
+                        logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
+                        await asyncio.sleep(sleep_time + 2)
+                        retries -= 1
+                    else:
+                        logger.error(f"Error copying message {msg_id}: {err}")
+                        error_files += 1
+                        break
+
+            if not success and retries == 0 and not error_files:
+                error_files += 1
 
             if idx % 5 == 0 or idx == total_files:
                 elapsed = time.time() - start_time
@@ -308,6 +317,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     task_data = {
+        'update': update,
         'source_channel_str': source_channel_str,
         'reverse_order': reverse_order,
         'status_msg': status_msg
