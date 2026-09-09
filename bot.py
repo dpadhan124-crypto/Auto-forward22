@@ -40,132 +40,125 @@ def generate_progress_bar(completed, total):
     return f"[{bar}] {int(percentage * 100)}%"
 
 
-async def setup_bots_and_topic_telethon(channel_input, target_group_id):
+async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
     """Promotes predefined bots with FloodWait safety, fetches channel entity, and creates a forum topic."""
-    session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
-    client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
+    if isinstance(channel_input, str):
+        channel_input = channel_input.strip()
+        if channel_input.startswith("-") or channel_input.isdigit():
+            channel_input = int(channel_input)
+
+    try:
+        channel = await client.get_entity(channel_input)
+    except FloodWaitError as fwe:
+        logger.warning(f"FloodWait on get_entity: sleeping for {fwe.seconds}s")
+        await asyncio.sleep(fwe.seconds + 2)
+        channel = await client.get_entity(channel_input)
+    except Exception as e:
+        raise ValueError(f"Could not resolve channel ID/username '{channel_input}': {e}")
+
+    channel_title = getattr(channel, 'title', f"Channel {getattr(channel, 'id', 'Unknown')}")
+
+    b1 = BOT_1_USERNAME.strip().replace("@", "")
+    b2 = BOT_2_USERNAME.strip().replace("@", "")
+
+    # 1. Invite and promote Bot 1 (Dps_storiesbot)
+    try:
+        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
+    except FloodWaitError as fwe:
+        await asyncio.sleep(fwe.seconds + 2)
+        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
+    except Exception:
+        pass
     
-    async with client:
-        if isinstance(channel_input, str):
-            channel_input = channel_input.strip()
-            if channel_input.startswith("-") or channel_input.isdigit():
-                channel_input = int(channel_input)
+    try:
+        await client.edit_admin(
+            entity=channel,
+            user=b1,
+            change_info=True, 
+            post_messages=True, 
+            edit_messages=True,
+            delete_messages=True, 
+            ban_users=True, 
+            invite_users=True,
+            pin_messages=True, 
+            add_admins=True, 
+            anonymous=False,
+            manage_call=True
+        )
+    except FloodWaitError as fwe:
+        await asyncio.sleep(fwe.seconds + 2)
+        await client.edit_admin(
+            entity=channel, user=b1, change_info=True, post_messages=True, 
+            edit_messages=True, delete_messages=True, ban_users=True, 
+            invite_users=True, pin_messages=True, add_admins=True, 
+            anonymous=False, manage_call=True
+        )
+    except Exception as e:
+        logger.warning(f"Notice regarding Bot 1 promotion: {e}")
 
-        try:
-            channel = await client.get_entity(channel_input)
-        except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on get_entity: sleeping for {fwe.seconds}s")
-            await asyncio.sleep(fwe.seconds + 2)
-            channel = await client.get_entity(channel_input)
-        except Exception as e:
-            raise ValueError(f"Could not resolve channel ID/username '{channel_input}': {e}")
+    # 2. Invite and promote Bot 2 (Testdp112232bot)
+    try:
+        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
+    except FloodWaitError as fwe:
+        await asyncio.sleep(fwe.seconds + 2)
+        await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
+    except Exception:
+        pass
 
-        channel_title = getattr(channel, 'title', f"Channel {getattr(channel, 'id', 'Unknown')}")
+    try:
+        await client.edit_admin(
+            entity=channel,
+            user=b2,
+            post_messages=True,
+            edit_messages=True,
+            delete_messages=True
+        )
+    except FloodWaitError as fwe:
+        await asyncio.sleep(fwe.seconds + 2)
+        await client.edit_admin(
+            entity=channel, user=b2, post_messages=True,
+            edit_messages=True, delete_messages=True
+        )
+    except Exception as e:
+        logger.warning(f"Notice regarding Bot 2 promotion: {e}")
 
-        b1 = BOT_1_USERNAME.strip().replace("@", "")
-        b2 = BOT_2_USERNAME.strip().replace("@", "")
+    # 3. Create a forum topic in the target group
+    thread_id = None
+    try:
+        result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
+            channel=target_group_id,
+            title=channel_title
+        ))
+        for update in result.updates:
+            if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
+                thread_id = update.id
+                break
+    except FloodWaitError as fwe:
+        await asyncio.sleep(fwe.seconds + 2)
+    except Exception as e:
+        logger.error(f"Failed to create forum topic via Telethon: {e}")
 
-        # 1. Invite and promote Bot 1 (Dps_storiesbot)
-        try:
-            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
-        except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds + 2)
-            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
-        except Exception:
-            pass
-        
-        try:
-            await client.edit_admin(
-                entity=channel,
-                user=b1,
-                change_info=True, 
-                post_messages=True, 
-                edit_messages=True,
-                delete_messages=True, 
-                ban_users=True, 
-                invite_users=True,
-                pin_messages=True, 
-                add_admins=True, 
-                anonymous=False,
-                manage_call=True
-            )
-        except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds + 2)
-            await client.edit_admin(
-                entity=channel, user=b1, change_info=True, post_messages=True, 
-                edit_messages=True, delete_messages=True, ban_users=True, 
-                invite_users=True, pin_messages=True, add_admins=True, 
-                anonymous=False, manage_call=True
-            )
-        except Exception as e:
-            logger.warning(f"Notice regarding Bot 1 promotion: {e}")
-
-        # 2. Invite and promote Bot 2 (Testdp112232bot)
-        try:
-            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
-        except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds + 2)
-            await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
-        except Exception:
-            pass
-
-        try:
-            await client.edit_admin(
-                entity=channel,
-                user=b2,
-                post_messages=True,
-                edit_messages=True,
-                delete_messages=True
-            )
-        except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds + 2)
-            await client.edit_admin(
-                entity=channel, user=b2, post_messages=True,
-                edit_messages=True, delete_messages=True
-            )
-        except Exception as e:
-            logger.warning(f"Notice regarding Bot 2 promotion: {e}")
-
-        # 3. Create a forum topic in the target group
-        thread_id = None
-        try:
-            result = await client(telethon.tl.functions.channels.CreateForumTopicRequest(
-                channel=target_group_id,
-                title=channel_title
-            ))
-            for update in result.updates:
-                if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
-                    thread_id = update.id
-                    break
-        except FloodWaitError as fwe:
-            await asyncio.sleep(fwe.seconds + 2)
-        except Exception as e:
-            logger.error(f"Failed to create forum topic via Telethon: {e}")
-
-        return channel, thread_id
+    return channel, thread_id
 
 
 async def process_forwarding_task(task_data):
-    """Processes a single task from the queue with FloodWait protection and real-time updates."""
-    update = task_data['update']
+    """Processes a single task using Telethon userbot session for forceful forwarding and FloodWait protection."""
+    status_msg = task_data['status_msg']
     source_channel_str = task_data['source_channel_str']
     reverse_order = task_data['reverse_order']
-    status_msg = task_data['status_msg']
 
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
-
-    try:
-        await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
-        channel_entity, message_thread_id = await setup_bots_and_topic_telethon(source_channel_str, TARGET_GROUP_ID)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Setup failed: {e}")
-        return
-
-    # Fetch message IDs using Telethon client with FloodWait protection
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
-    message_ids = []
-    
+
     async with client:
+        try:
+            await status_msg.edit_text("⚙️ Setting up bots, creating forum topic, and indexing files...")
+            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Setup failed: {e}")
+            return
+
+        message_ids = []
         try:
             async for message in client.iter_messages(channel_entity):
                 message_ids.append(message.id)
@@ -175,87 +168,79 @@ async def process_forwarding_task(task_data):
             async for message in client.iter_messages(channel_entity):
                 message_ids.append(message.id)
 
-    if reverse_order:
-        message_ids.reverse()
+        if reverse_order:
+            message_ids.reverse()
 
-    total_files = len(message_ids)
-    forwarded_files = 0
-    error_files = 0
-    start_time = time.time()
+        total_files = len(message_ids)
+        forwarded_files = 0
+        error_files = 0
+        start_time = time.time()
 
-    await status_msg.edit_text(
-        f"🚀 **Forwarding Task Started**\n\n"
-        f"📊 Progress: [░░░░░░░░░░] 0%\n"
-        f"📁 Total Files: {total_files}\n"
-        f"✅ Forwarded: 0\n"
-        f"❌ Errors: 0\n"
-        f"⏳ Remaining Time: Calculating...",
-        parse_mode="Markdown"
-    )
+        await status_msg.edit_text(
+            f"🚀 **Forwarding Task Started**\n\n"
+            f"📊 Progress: [░░░░░░░░░░] 0%\n"
+            f"📁 Total Files: {total_files}\n"
+            f"✅ Forwarded: 0\n"
+            f"❌ Errors: 0\n"
+            f"⏳ Remaining Time: Calculating...",
+            parse_mode="Markdown"
+        )
 
-    bot = update.get_bot()
-    for idx, msg_id in enumerate(message_ids, start=1):
-        success = False
-        retries = 3
-        while retries > 0 and not success:
-            try:
-                kwargs = {
-                    "chat_id": TARGET_GROUP_ID,
-                    "from_chat_id": channel_entity.id,
-                    "message_id": msg_id
-                }
-                if message_thread_id:
-                    kwargs["message_thread_id"] = message_thread_id
+        target_entity = await client.get_entity(TARGET_GROUP_ID)
 
-                await bot.copy_message(**kwargs)
-                forwarded_files += 1
-                success = True
-            except Exception as err:
-                # Check for Telegram Bot API FloodWait or rate limit error strings
-                err_str = str(err).lower()
-                if "flood" in err_str or "retry after" in err_str:
-                    import re
-                    match = re.search(r"retry after (\d+)", err_str)
-                    sleep_time = int(match.group(1)) if match else 15
-                    logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
-                    await asyncio.sleep(sleep_time + 2)
+        for idx, msg_id in enumerate(message_ids, start=1):
+            success = False
+            retries = 3
+            while retries > 0 and not success:
+                try:
+                    await client.forward_messages(
+                        entity=target_entity,
+                        messages=msg_id,
+                        from_peer=channel_entity,
+                        reply_to=message_thread_id
+                    )
+                    forwarded_files += 1
+                    success = True
+                except FloodWaitError as fwe:
+                    logger.warning(f"Telethon FloodWait: sleeping for {fwe.seconds}s")
+                    await asyncio.sleep(fwe.seconds + 2)
                     retries -= 1
-                else:
+                except Exception as err:
                     logger.error(f"Error forwarding message {msg_id}: {err}")
                     error_files += 1
                     break
 
-        if not success and not error_files:
-            error_files += 1
+            if not success and retries == 0:
+                error_files += 1
 
-        if idx % 5 == 0 or idx == total_files:
-            elapsed = time.time() - start_time
-            avg_time = elapsed / idx if idx > 0 else 0
-            eta = int(avg_time * (total_files - idx))
-            eta_str = f"{eta // 60}m {eta % 60}s" if eta > 60 else f"{eta}s"
+            if idx % 5 == 0 or idx == total_files:
+                elapsed = time.time() - start_time
+                avg_time = elapsed / idx if idx > 0 else 0
+                eta = int(avg_time * (total_files - idx))
+                eta_str = f"{eta // 60}m {eta % 60}s" if eta > 60 else f"{eta}s"
 
-            try:
-                await status_msg.edit_text(
-                    f"🚀 **Forwarding Task in Progress**\n\n"
-                    f"📊 Progress: {generate_progress_bar(idx, total_files)}\n"
-                    f"📁 Total Files: {total_files}\n"
-                    f"✅ Forwarded: {forwarded_files}\n"
-                    f"❌ Errors: {error_files}\n"
-                    f"⏳ Remaining Time: {eta_str}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+                try:
+                    await status_msg.edit_text(
+                        f"🚀 **Forwarding Task in Progress**\n\n"
+                        f"📊 Progress: {generate_progress_bar(idx, total_files)}\n"
+                        f"📁 Total Files: {total_files}\n"
+                        f"✅ Forwarded: {forwarded_files}\n"
+                        f"❌ Errors: {error_files}\n"
+                        f"⏳ Remaining Time: {eta_str}",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
-    await status_msg.edit_text(
-        f"✨ **Forwarding Task Completed!**\n\n"
-        f"📊 Progress: [██████████] 100%\n"
-        f"📁 Total Files: {total_files}\n"
-        f"✅ Forwarded: {forwarded_files}\n"
-        f"❌ Errors: {error_files}\n"
-        f"⏱️ Total Time: {int(time.time() - start_time)}s",
-        parse_mode="Markdown"
-    )
+        await status_msg.edit_text(
+            f"✨ **Forwarding Task Completed!**\n\n"
+            f"📊 Progress: [██████████] 100%\n"
+            f"📁 Total Files: {total_files}\n"
+            f"✅ Forwarded: {forwarded_files}\n"
+            f"❌ Errors: {error_files}\n"
+            f"⏱️ Total Time: {int(time.time() - start_time)}s",
+            parse_mode="Markdown"
+        )
 
 
 async def task_worker():
@@ -314,7 +299,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     task_data = {
-        'update': update,
         'source_channel_str': source_channel_str,
         'reverse_order': reverse_order,
         'status_msg': status_msg
@@ -353,7 +337,7 @@ async def run_bot():
     # Start the HTTP server to satisfy Render's port binding requirements
     threading.Thread(target=run_http_server, daemon=True).start()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
@@ -365,7 +349,7 @@ async def run_bot():
     # Start background task worker loop for sequential quest execution
     asyncio.create_task(task_worker())
     
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     
     stop_event = asyncio.Event()
     await stop_event.wait()
