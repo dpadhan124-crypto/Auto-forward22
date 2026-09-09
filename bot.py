@@ -27,7 +27,7 @@ CONFIG = {
     "target_chat_id": -1004440356312,
     "destination_type": "topic",  # "topic" or "chat"
     "bot_1_username": "Dps_storiesbot",
-    "bot_2_username": "Testdp112232bot"
+    "bot_2_username": "DPS_xbot"
 }
 
 # Runtime storage for session string, task queue, and cancellation tracking
@@ -304,7 +304,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "👋 Welcome! I am your automated forwarding and management bot.\n\n"
         "Commands:\n"
         "• /add_session - Save your Telethon session string\n"
-        "• `/send -100` - Setup source channel and choose mode\n"
+        "• `/send -100` - Setup source channel, create topic, and choose mode\n"
         "• /forward - Interactive custom file collection mode\n"
         "• /settings - Configure target group ID and destination types\n"
         "• /cancel - Cancel active process and clear queue",
@@ -380,7 +380,7 @@ async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /send command by promoting bots, creating topic/destination, and presenting choice buttons."""
+    """Handles /send command by promoting bots, creating topic named after the channel, and presenting choice buttons."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     if not session_to_use:
         await update.message.reply_text("⚠️ No session string configured! Please use /add_session first.", parse_mode="Markdown")
@@ -404,6 +404,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text(f"❌ Setup failed: {e}")
             return
 
+    # Save state for mode choice, storing the created topic ID correctly for manual routing as well
     context.user_data['source_channel_str'] = source_channel_str
     context.user_data['reverse_order'] = reverse_order
     context.user_data['topic_id'] = message_thread_id
@@ -415,7 +416,8 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await status_msg.edit_text(
-        f"✅ **Admins promoted & Topic created successfully!** (Topic ID: `{message_thread_id}`)\n\n"
+        f"✅ **Admins promoted & Topic created successfully!**\n"
+        f"📌 Topic ID: `{message_thread_id}`\n\n"
         f"Please select your preferred forwarding mode below:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
@@ -423,7 +425,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles selection between Automated and Manual forwarding."""
+    """Handles selection between Automated and Manual forwarding and pins the initialized control panel message."""
     query = update.callback_query
     await query.answer()
 
@@ -435,7 +437,7 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "mode_auto":
         queue_position = task_queue.qsize() + 1
         await query.edit_message_text(
-            f"📋 **Automated Task Added to Quest Queue!**\n"
+            f"📋 **Automated Task Added to Queue!**\n"
             f"📌 Position in Queue: `{queue_position}`\n"
             f"⏳ Waiting for previous tasks to finish...",
             parse_mode="Markdown"
@@ -513,7 +515,7 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def execute_manual_forward(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes and dispatches manually collected files anonymously into the destination."""
+    """Processes and dispatches manually collected files anonymously into the destination topic."""
     files = context.user_data.get('manual_files', [])
     if not files:
         await message.reply_text("⚠️ No files have been saved yet! Send files first.", parse_mode="Markdown")
@@ -608,7 +610,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         f"🛑 **Cancellation Triggered!**\n"
         f"• Active process aborted.\n"
-        f"• Cleared `{cleared_count}` pending tasks from the quest queue.",
+        f"• Cleared `{cleared_count}` pending tasks from the queue.",
         parse_mode="Markdown"
     )
 
@@ -651,6 +653,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is running!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
@@ -659,7 +665,7 @@ def run_http_server():
 
 
 async def run_bot():
-    # Start the HTTP server to satisfy Render's port binding requirements
+    # Start the HTTP server to satisfy Render's port binding requirements & HEAD checks
     threading.Thread(target=run_http_server, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
@@ -677,7 +683,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     
-    # Start background task worker loop for sequential quest execution
+    # Start background task worker loop for sequential task execution
     asyncio.create_task(task_worker())
     
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
