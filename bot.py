@@ -66,7 +66,7 @@ async def setup_bots_and_topic_telethon(channel_input, target_group_id):
             change_info=True, post_messages=True, edit_messages=True,
             delete_messages=True, ban_users=True, invite_users=True,
             pin_messages=True, add_admins=True, anonymous=False,
-            manage_call=True, manage_topics=True, 
+            manage_call=True, 
             post_stories=True, edit_stories=True, delete_stories=True
         )
 
