@@ -1,2 +1,3 @@
-pyrogram
-tgcrypto
+pyrofork==2.3.69
+aiohttp==3.11.11
+tgcrypto==1.2.5
