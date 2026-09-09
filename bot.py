@@ -17,15 +17,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION (Render Environment Safe) ---
+# --- CONFIGURATION & CONFIGURABLE SETTINGS ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-TARGET_GROUP_ID = -1004440356312
 
-# Pre-defined bot configuration
-BOT_1_USERNAME = "Dps_storiesbot"   # Full administrative permissions
-BOT_2_USERNAME = "Testdp112232bot"  # Forwarder / message copying bot
+# Default persistent configurations (can be updated via /settings)
+CONFIG = {
+    "target_chat_id": -1004440356312,
+    "destination_type": "topic",  # "topic" or "chat"
+    "bot_1_username": "Dps_storiesbot",
+    "bot_2_username": "Testdp112232bot"
+}
 
 # Runtime storage for session string, task queue, and cancellation tracking
 RUNTIME_SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -41,8 +44,8 @@ def generate_progress_bar(completed, total):
     return f"[{bar}] {int(percentage * 100)}%"
 
 
-async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
-    """Promotes predefined bots with native FloodWait handling, fetches channel entity, and creates a forum topic."""
+async def setup_bots_and_topic_telethon(client, channel_input):
+    """Promotes predefined bots, fetches channel entity, and handles destination setup based on config."""
     if isinstance(channel_input, str):
         channel_input = channel_input.strip()
         if channel_input.startswith("-") or channel_input.isdigit():
@@ -60,16 +63,15 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
 
     channel_title = getattr(channel, 'title', f"Channel {getattr(channel, 'id', 'Unknown')}")
 
-    b1 = BOT_1_USERNAME.strip().replace("@", "")
-    b2 = BOT_2_USERNAME.strip().replace("@", "")
+    b1 = CONFIG["bot_1_username"].strip().replace("@", "")
+    b2 = CONFIG["bot_2_username"].strip().replace("@", "")
 
-    # 1. Invite and promote Bot 1 (Dps_storiesbot)
+    # 1. Invite and promote Bot 1
     while True:
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b1]))
             break
         except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on invite Bot 1: sleeping for {fwe.seconds} seconds")
             await asyncio.sleep(fwe.seconds + 2)
         except Exception:
             break
@@ -77,34 +79,24 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
     while True:
         try:
             await client.edit_admin(
-                entity=channel,
-                user=b1,
-                change_info=True, 
-                post_messages=True, 
-                edit_messages=True,
-                delete_messages=True, 
-                ban_users=True, 
-                invite_users=True,
-                pin_messages=True, 
-                add_admins=True, 
-                anonymous=False,
-                manage_call=True
+                entity=channel, user=b1, change_info=True, post_messages=True, 
+                edit_messages=True, delete_messages=True, ban_users=True, 
+                invite_users=True, pin_messages=True, add_admins=True, 
+                anonymous=False, manage_call=True
             )
             break
         except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on edit_admin Bot 1: sleeping for {fwe.seconds} seconds")
             await asyncio.sleep(fwe.seconds + 2)
         except Exception as e:
             logger.warning(f"Notice regarding Bot 1 promotion: {e}")
             break
 
-    # 2. Invite and promote Bot 2 (Testdp112232bot)
+    # 2. Invite and promote Bot 2
     while True:
         try:
             await client(telethon.tl.functions.channels.InviteToChannelRequest(channel=channel, users=[b2]))
             break
         except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on invite Bot 2: sleeping for {fwe.seconds} seconds")
             await asyncio.sleep(fwe.seconds + 2)
         except Exception:
             break
@@ -112,39 +104,35 @@ async def setup_bots_and_topic_telethon(client, channel_input, target_group_id):
     while True:
         try:
             await client.edit_admin(
-                entity=channel,
-                user=b2,
-                post_messages=True,
-                edit_messages=True,
-                delete_messages=True
+                entity=channel, user=b2, post_messages=True,
+                edit_messages=True, delete_messages=True
             )
             break
         except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on edit_admin Bot 2: sleeping for {fwe.seconds} seconds")
             await asyncio.sleep(fwe.seconds + 2)
         except Exception as e:
             logger.warning(f"Notice regarding Bot 2 promotion: {e}")
             break
 
-    # 3. Create a forum topic in the target group with FloodWait protection
+    # 3. Create a forum topic if destination_type is 'topic'
     thread_id = None
-    while True:
-        try:
-            result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
-                peer=target_group_id,
-                title=channel_title
-            ))
-            for update in result.updates:
-                if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
-                    thread_id = update.id
-                    break
-            break
-        except FloodWaitError as fwe:
-            logger.warning(f"FloodWait on CreateForumTopic: sleeping for {fwe.seconds} seconds")
-            await asyncio.sleep(fwe.seconds + 2)
-        except Exception as e:
-            logger.error(f"Failed to create forum topic via Telethon: {e}")
-            break
+    if CONFIG["destination_type"] == "topic":
+        while True:
+            try:
+                result = await client(telethon.tl.functions.messages.CreateForumTopicRequest(
+                    peer=CONFIG["target_chat_id"],
+                    title=channel_title
+                ))
+                for update in result.updates:
+                    if isinstance(update, telethon.tl.types.UpdateMessageService) and isinstance(update.action, telethon.tl.types.MessageActionTopicCreate):
+                        thread_id = update.id
+                        break
+                break
+            except FloodWaitError as fwe:
+                await asyncio.sleep(fwe.seconds + 2)
+            except Exception as e:
+                logger.error(f"Failed to create forum topic via Telethon: {e}")
+                break
 
     return channel, thread_id
 
@@ -164,8 +152,8 @@ async def process_forwarding_task(task_data):
 
     async with client:
         try:
-            await status_msg.edit_text("⚙️ Setting up bots and creating destination forum topic...")
-            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
+            await status_msg.edit_text("⚙️ Setting up bots and preparing destination...")
+            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str)
         except Exception as e:
             error_reason = f"Setup failed: `{type(e).__name__}: {str(e)}`"
             logger.error(error_reason)
@@ -182,7 +170,6 @@ async def process_forwarding_task(task_data):
                     message_ids.append(message.id)
                 break
             except FloodWaitError as fwe:
-                logger.warning(f"FloodWait during iteration: sleeping for {fwe.seconds} seconds")
                 await asyncio.sleep(fwe.seconds + 2)
             except Exception as e:
                 error_reason = f"Failed to iterate channel messages: `{type(e).__name__}: {str(e)}`"
@@ -225,11 +212,11 @@ async def process_forwarding_task(task_data):
             while retries > 0 and not success:
                 try:
                     kwargs = {
-                        "chat_id": TARGET_GROUP_ID,
+                        "chat_id": CONFIG["target_chat_id"],
                         "from_chat_id": channel_entity.id,
                         "message_id": msg_id
                     }
-                    if message_thread_id:
+                    if CONFIG["destination_type"] == "topic" and message_thread_id:
                         kwargs["message_thread_id"] = int(message_thread_id)
 
                     await bot.copy_message(**kwargs)
@@ -241,7 +228,6 @@ async def process_forwarding_task(task_data):
                         import re
                         match = re.search(r"retry after (\d+)", err_str)
                         sleep_time = int(match.group(1)) if match else 15
-                        logger.warning(f"Telegram Bot API FloodWait: sleeping for {sleep_time}s")
                         await asyncio.sleep(sleep_time + 2)
                         retries -= 1
                     else:
@@ -287,7 +273,7 @@ async def process_forwarding_task(task_data):
 
 
 async def task_worker():
-    """Background worker that continuously pulls tasks from the queue sequentially (Quest flow)."""
+    """Background worker that continuously pulls tasks from the queue sequentially."""
     while True:
         task_data = await task_queue.get()
         try:
@@ -300,16 +286,82 @@ async def task_worker():
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /start command."""
+    """Handles /start command with dynamic inline buttons and quick link support."""
+    bot_user = (await context.bot.get_me()).username
+    keyboard = [
+        [InlineKeyboardButton("🚀 Send Command Quick Link", url=f"https://t.me/{bot_user}?text=%2Fsend%20-100")],
+        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="open_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
         "👋 Welcome! I am your automated forwarding and management bot.\n\n"
         "Commands:\n"
         "• `/add_session` - Save your Telethon session string\n"
-        "• `/send {channel_id} [r]` - Setup source channel and prompt mode selection (Automated/Manual)\n"
+        "• `/send {channel_id} [r]` - Setup source channel and choose mode\n"
         "• `/forward` - Interactive custom file collection mode\n"
-        "• `/cancel` - Cancel active process and clear remaining queue",
+        "• `/settings` - Configure target group ID and destination types\n"
+        "• `/cancel` - Cancel active process and clear queue",
+        reply_markup=reply_markup,
         parse_mode="Markdown"
     )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Displays configuration settings menu."""
+    keyboard = [
+        [InlineKeyboardButton(f"📁 Destination Mode: {CONFIG['destination_type'].capitalize()}", callback_data="toggle_dest_type")],
+        [InlineKeyboardButton(f"🎯 Target Chat ID: {CONFIG['target_chat_id']}", callback_data="set_target_id")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "⚙️ **Bot Configuration Settings**\n\n"
+        f"• **Target Chat ID**: `{CONFIG['target_chat_id']}`\n"
+        f"• **Destination Type**: `{CONFIG['destination_type']}` (`topic` creates forum thread per channel, `chat` posts directly to chat/channel)\n"
+        f"• **Admin Bot 1**: `{CONFIG['bot_1_username']}`\n"
+        f"• **Admin Bot 2**: `{CONFIG['bot_2_username']}`",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles configuration toggles."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "open_settings":
+        keyboard = [
+            [InlineKeyboardButton(f"📁 Destination Mode: {CONFIG['destination_type'].capitalize()}", callback_data="toggle_dest_type")],
+            [InlineKeyboardButton(f"🎯 Target Chat ID: {CONFIG['target_chat_id']}", callback_data="set_target_id")]
+        ]
+        await query.message.edit_text(
+            "⚙️ **Bot Configuration Settings**\n\n"
+            f"• **Target Chat ID**: `{CONFIG['target_chat_id']}`\n"
+            f"• **Destination Type**: `{CONFIG['destination_type']}`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data == "toggle_dest_type":
+        CONFIG["destination_type"] = "chat" if CONFIG["destination_type"] == "topic" else "topic"
+        keyboard = [
+            [InlineKeyboardButton(f"📁 Destination Mode: {CONFIG['destination_type'].capitalize()}", callback_data="toggle_dest_type")],
+            [InlineKeyboardButton(f"🎯 Target Chat ID: {CONFIG['target_chat_id']}", callback_data="set_target_id")]
+        ]
+        await query.edit_message_text(
+            "⚙️ **Bot Configuration Settings**\n\n"
+            f"• **Target Chat ID**: `{CONFIG['target_chat_id']}`\n"
+            f"• **Destination Type**: `{CONFIG['destination_type']}`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data == "set_target_id":
+        context.user_data['step'] = 'waiting_target_id'
+        await query.message.reply_text("📌 Please send the new integer **Target Chat ID** in the next message:", parse_mode="Markdown")
 
 
 async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,7 +374,7 @@ async def add_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /send command by promoting bots, creating topic, and presenting choice buttons."""
+    """Handles /send command by promoting bots, creating topic/destination, and presenting choice buttons."""
     session_to_use = RUNTIME_SESSION_STRING or os.environ.get("SESSION_STRING", "")
     if not session_to_use:
         await update.message.reply_text("⚠️ No session string configured! Please use `/add_session` first.", parse_mode="Markdown")
@@ -336,21 +388,20 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     source_channel_str = args[0]
     reverse_order = len(args) > 1 and args[1].lower() == 'r'
 
-    status_msg = await update.message.reply_text("⚙️ Setting up bots in source channel and creating destination forum topic...")
+    status_msg = await update.message.reply_text("⚙️ Setting up bots in source channel and setting up destination...")
 
     client = TelegramClient(StringSession(session_to_use), API_ID, API_HASH)
     async with client:
         try:
-            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str, TARGET_GROUP_ID)
+            channel_entity, message_thread_id = await setup_bots_and_topic_telethon(client, source_channel_str)
         except Exception as e:
             await status_msg.edit_text(f"❌ Setup failed: {e}")
             return
 
-    # Save details into user_data for mode callback execution
+    # Save state for mode choice
     context.user_data['source_channel_str'] = source_channel_str
     context.user_data['reverse_order'] = reverse_order
     context.user_data['topic_id'] = message_thread_id
-    context.user_data['status_msg_id'] = status_msg.id
 
     keyboard = [
         [InlineKeyboardButton("🤖 Automated Forwarding", callback_data="mode_auto")],
@@ -359,7 +410,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await status_msg.edit_text(
-        f"✅ **Admins successfully promoted & Topic created!**\n\n"
+        f"✅ **Admins successfully promoted & Destination ready!**\n\n"
         f"Please select your preferred forwarding mode below:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
@@ -367,7 +418,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles selection between Automated and Manual forwarding after successful setup."""
+    """Handles selection between Automated and Manual forwarding."""
     query = update.callback_query
     await query.answer()
 
@@ -399,14 +450,17 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
         context.user_data['manual_files'] = []
         context.user_data['step'] = 'collecting_manual_files'
 
+        order_text = "Normal"
+        topic_display = topic_id if topic_id else "Default Chat"
+
         keyboard = [
-            [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
+            [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
             [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
         ]
         await query.edit_message_text(
             f"📝 **Manual Forwarding Mode Initialized**\n"
-            f"• Destination Topic ID: `{topic_id}`\n"
-            f"• Current Order: `Normal`\n\n"
+            f"• Destination Topic ID: `{topic_display}`\n"
+            f"• Current Order: `{order_text}`\n\n"
             f"Send files to the bot one by one. Click **Done** when finished.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
@@ -426,14 +480,15 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         order_text = "Reverse" if new_order == 'reverse' else "Normal"
         topic_id = context.user_data.get('manual_topic_id')
+        topic_display = topic_id if topic_id else "Default Chat"
 
         keyboard = [
-            [InlineKeyboardButton(f"🔄 Order: {order_text.capitalize()}", callback_data="toggle_manual_order")],
+            [InlineKeyboardButton(f"🔄 Order: {order_text}", callback_data="toggle_manual_order")],
             [InlineKeyboardButton("✅ Done / Start Manual Dispatch", callback_data="trigger_manual_don")]
         ]
         await query.edit_message_text(
             f"📝 **Manual Forwarding Mode Initialized**\n"
-            f"• Destination Topic ID: `{topic_id}`\n"
+            f"• Destination Topic ID: `{topic_display}`\n"
             f"• Current Order: `{order_text}`\n\n"
             f"Send files to the bot one by one. Click **Done** when finished.",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -445,7 +500,7 @@ async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def execute_manual_forward(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes and dispatches manually collected files anonymously into the destination topic."""
+    """Processes and dispatches manually collected files anonymously into the destination."""
     files = context.user_data.get('manual_files', [])
     if not files:
         await message.reply_text("⚠️ No files have been saved yet! Send files first.", parse_mode="Markdown")
@@ -468,11 +523,11 @@ async def execute_manual_forward(message, context: ContextTypes.DEFAULT_TYPE) ->
         msg_id = item['msg_id']
         try:
             kwargs = {
-                "chat_id": TARGET_GROUP_ID,
+                "chat_id": CONFIG["target_chat_id"],
                 "from_chat_id": chat_id,
                 "message_id": msg_id
             }
-            if topic_id:
+            if CONFIG["destination_type"] == "topic" and topic_id:
                 kwargs["message_thread_id"] = int(topic_id)
 
             await bot.copy_message(**kwargs)
@@ -502,11 +557,10 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     keyboard = [
         [InlineKeyboardButton("🔄 Order: Normal", callback_data="toggle_manual_order")],
-        [InlineKeyboardButton("📌 Set Topic ID", callback_data="set_manual_topic")],
         [InlineKeyboardButton("✅ Done / Start", callback_data="trigger_manual_don")]
     ]
     await update.message.reply_text(
-        "📦 **Custom Manual Forwarding Mode**\n\n"
+        "📝 **Custom Manual Forwarding Mode**\n\n"
         "Send files to the bot one by one, then click **Done**.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -550,6 +604,16 @@ async def handle_message_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ **Session String successfully saved** for this runtime session!", parse_mode="Markdown")
         return
 
+    elif step == 'waiting_target_id':
+        text = update.message.text.strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            CONFIG["target_chat_id"] = int(text)
+            user_data['step'] = None
+            await update.message.reply_text(f"✅ Target Chat ID successfully updated to `{text}`!", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️ Invalid ID. Please send a valid integer chat ID.", parse_mode="Markdown")
+        return
+
     elif step == 'collecting_manual_files':
         user_data['manual_files'].append({
             'chat_id': update.effective_chat.id,
@@ -581,10 +645,12 @@ async def run_bot():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("forward", forward_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("add_session", add_session_command))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern="^(open_settings|toggle_dest_type|set_target_id)$"))
     application.add_handler(CallbackQueryHandler(mode_selection_callback, pattern="^mode_"))
-    application.add_handler(CallbackQueryHandler(manual_callback, pattern="^(toggle_manual_order|trigger_manual_don|set_manual_topic)$"))
+    application.add_handler(CallbackQueryHandler(manual_callback, pattern="^(toggle_manual_order|trigger_manual_don)$"))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_flow))
     
     await application.initialize()
