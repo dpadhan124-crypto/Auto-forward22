@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,7 +28,6 @@ def index():
 
 # In-memory storage for user sessions and states
 USER_DATA = {}
-# Structure: { user_id: { 'session': str, 'bot1': str, 'bot2': str, 'dest_group': int, 'topics': {channel_name: topic_id}, 'files': [] } }
 
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 API_ID = int(os.getenv("API_ID", "123456"))
@@ -44,7 +44,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if len(args) < 4:
-        await update.message.reply_text("Usage: /settings <session_string> <bot1_username> <bot2_username> <destination_group_id>")
+        await update.message.reply_text("Usage: `/settings <session_string> <bot1_username> <bot2_username> <destination_group_id>`")
         return
 
     USER_DATA[user_id]["session"] = args[0]
@@ -68,11 +68,9 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         await client.start(session=data["session"])
         
-        # Resolve channel and get title
         entity = await client.get_entity(channel_input)
         channel_name = entity.title
         
-        # Promote Bot 1 and Bot 2 to admin
         admin_rights = ChatAdminRights(
             add_admins=True, invite_users=True, change_info=True, 
             ban_users=True, delete_messages=True, pin_messages=True
@@ -84,8 +82,6 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await update.message.reply_text("Successfully promoted both bots to admin in the channel!")
         
-        # Create topic in Destination Group (Note: Telegram Bot API is needed for forum topic creation)
-        # For simplicity, we store the channel name mapping here
         data["current_channel"] = channel_name
         await update.message.reply_text(
             f"Channel '{channel_name}' processed. Now send the files you want to forward. When finished, click Done.",
@@ -130,8 +126,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(f"Successfully sent {len(files)} files to destination!")
         USER_DATA[user_id]["files"] = []
 
-# Main setup function for polling
-def main():
+def run_telegram_bot():
     application = ApplicationBuilder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
@@ -142,8 +137,11 @@ def main():
     
     application.run_polling()
 
+# Start the telegram bot polling in a separate background thread so Flask can run on the main thread for Render
 if __name__ == "__main__":
-    # If running locally or testing directly, execute polling. 
-    # Render will use Gunicorn to run the Flask app.
-    import threading
-    threading.Thread(target=main).app = None # Placeholder for background bot runner if needed
+    t = threading.Thread(target=run_telegram_bot)
+    t.daemon = True
+    t.start()
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
