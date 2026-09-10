@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import os
+import re
+import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,17 +18,18 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global session store, task queue, and default authorized admin
+# Global session store, task queue, and admin store
 user_sessions = {}
 task_queue = asyncio.Queue()
 DEFAULT_ADMIN_ID = 8323137024
+DYNAMIC_ADMINS = set()
 
 def is_admin(user_id: int) -> bool:
     """Helper function to check if a user is an authorized admin."""
     additional_admins = [
         int(uid.strip()) for uid in os.getenv("ADMIN_IDS", "").split(",") if uid.strip().isdigit()
     ]
-    return user_id == DEFAULT_ADMIN_ID or user_id in additional_admins
+    return user_id == DEFAULT_ADMIN_ID or user_id in additional_admins or user_id in DYNAMIC_ADMINS
 
 def admin_only(func):
     """Decorator to restrict command and message handlers to admins only."""
@@ -40,6 +43,49 @@ def admin_only(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
+
+def parse_chat_string(s: str):
+    """Parses raw string IDs into integers or usernames."""
+    s = s.strip()
+    if s.startswith('@'):
+        return s
+    if s.isdigit():
+        if len(s) >= 10 and not s.startswith('-100'):
+            return int(f"-100{s}")
+        return int(s)
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+def parse_chat_and_topic_input(text: str):
+    """Robustly parses various chat and topic input formats (IDs, Usernames, URLs)."""
+    text = text.strip()
+    
+    # Case 1: URL with topic like https://t.me/c/4429889875/412 or https://t.me/username/412
+    match_url_topic = re.match(r'https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(\d+)', text)
+    if match_url_topic:
+        g1, g2, t_id = match_url_topic.groups()
+        chat_id = int(f"-100{g1}") if g1 else f"@{g2}"
+        return chat_id, int(t_id)
+
+    # Case 2: URL without topic like https://t.me/c/4429889875 or https://t.me/username
+    match_url = re.match(r'https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/?$', text)
+    if match_url:
+        g1, g2 = match_url.groups()
+        chat_id = int(f"-100{g1}") if g1 else f"@{g2}"
+        return chat_id, None
+
+    # Case 3: Explicit slash separation like -1004429889875/412 or 4429889875/412
+    if '/' in text:
+        parts = text.split('/')
+        raw_chat = parts[0].strip()
+        t_id = parts[1].strip()
+        topic_id = int(t_id) if t_id.isdigit() else None
+        return parse_chat_string(raw_chat), topic_id
+
+    # Case 4: Plain identifier format (-100..., @username, raw digits)
+    return parse_chat_string(text), None
 
 async def health_check(request):
     """Dummy web server handler to satisfy Render's port binding requirement."""
@@ -57,9 +103,8 @@ async def start_web_server():
     logger.info(f"Web server started on port {port} for Render.")
 
 async def self_ping():
-    """Periodically pigns the Render app URL to keep it awake on the free tier."""
+    """Periodically pings the Render app URL to keep it awake on the free tier."""
     url = "https://forwardbot-cx7a.onrender.com"
-    # Wait a short moment for the web server to fully bind and start accepting requests
     await asyncio.sleep(10)
     while True:
         try:
@@ -68,7 +113,6 @@ async def self_ping():
                     logger.info(f"Self-ping successful: {response.status}")
         except Exception as e:
             logger.error(f"Self-ping failed: {e}")
-        # Wait for 5 minutes (300 seconds)
         await asyncio.sleep(300)
 
 @admin_only
@@ -89,6 +133,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[update.effective_user.id] = {"step": "idle"}
 
 @admin_only
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to add a new admin dynamically via User ID or reply."""
+    args = context.args
+    user_id_to_add = None
+
+    if args and args[0].isdigit():
+        user_id_to_add = int(args[0])
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        user_id_to_add = update.message.reply_to_message.from_user.id
+
+    if not user_id_to_add:
+        await update.message.reply_text(
+            "❌ Please provide a valid numeric user ID or reply to the user's message.\nUsage: `/add_admin <user_id>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    DYNAMIC_ADMINS.add(user_id_to_add)
+    await update.message.reply_text(f"✅ Successfully added user `{user_id_to_add}` as an admin!", parse_mode="Markdown")
+
+@admin_only
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button interactions."""
     query = update.callback_query
@@ -97,7 +162,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "start_forward_workflow":
         user_sessions[user_id] = {"step": "awaiting_destination"}
-        await query.message.reply_text("📥 Please send the **Destination Group ID** (e.g., -100xxxxxxxxxx):", parse_mode="Markdown")
+        await query.message.reply_text("📥 Please send the **Destination Group ID, Link, or Topic** (e.g., `-1004429889875/412` or `https://t.me/...`):", parse_mode="Markdown")
         return
 
     state = user_sessions.get(user_id)
@@ -114,7 +179,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles text inputs (destination/source IDs) and media files."""
+    """Handles flexible text inputs and media files."""
     user_id = update.effective_user.id
     user_state = user_sessions.get(user_id, {})
     step = user_state.get("step")
@@ -122,37 +187,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "awaiting_destination":
         dest_input = update.message.text.strip()
         try:
-            dest_chat_id = int(dest_input)
+            dest_chat_id, dest_topic_id = parse_chat_and_topic_input(dest_input)
             member = await context.bot.get_chat_member(chat_id=dest_chat_id, user_id=context.bot.id)
             if member.status not in ["administrator", "creator"]:
                 raise Exception("Bot is not an admin")
             
             user_sessions[user_id]["destination_group_id"] = dest_chat_id
+            if dest_topic_id:
+                user_sessions[user_id]["destination_topic_id"] = dest_topic_id
+
             user_sessions[user_id]["step"] = "awaiting_source"
-            await update.message.reply_text("✅ Destination saved! Now send your source **Channel ID** or **Username** (e.g., @mychannel or -100...):")
+            await update.message.reply_text("✅ Destination saved! Now send your source **Channel ID, Username, or Link** (e.g., `@tdbbbsh`, `4429889875`, or `https://t.me/...`):")
         except Exception:
             keyboard = [[InlineKeyboardButton("➕ Add Bot as Admin", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")]]
             await update.message.reply_text(
-                "❌ Error: Bot is not an admin in the destination group or ID is invalid.",
+                "❌ Error: Bot is not an admin in the destination group or input is invalid.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
     elif step == "awaiting_source":
         source_input = update.message.text.strip()
         try:
-            chat = await context.bot.get_chat(source_input)
+            source_chat_id, _ = parse_chat_and_topic_input(source_input)
+            chat = await context.bot.get_chat(source_chat_id)
             member = await context.bot.get_chat_member(chat_id=chat.id, user_id=context.bot.id)
             if member.status not in ["administrator", "creator"]:
                 raise Exception("Bot is not an admin")
 
-            channel_name = chat.title
+            channel_name = chat.title or "Forwarded Files"
             dest_group_id = user_sessions[user_id]["destination_group_id"]
+            preset_topic_id = user_sessions[user_id].get("destination_topic_id")
             
-            topic = await context.bot.create_forum_topic(chat_id=dest_group_id, name=channel_name)
+            if preset_topic_id:
+                topic_id = preset_topic_id
+            else:
+                topic = await context.bot.create_forum_topic(chat_id=dest_group_id, name=channel_name)
+                topic_id = topic.message_thread_id
             
             user_sessions[user_id].update({
                 "step": "collecting_files",
-                "topic_id": topic.message_thread_id,
+                "topic_id": topic_id,
                 "forward_mode": "regular",
                 "files": []
             })
@@ -161,7 +235,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             keyboard = [[InlineKeyboardButton("➕ Add Bot as Admin", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")]]
             await update.message.reply_text(
-                "❌ Error: Bot lacks admin permissions in the source channel or ID is invalid.",
+                "❌ Error: Bot lacks admin permissions in the source or input format is invalid.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
@@ -296,7 +370,6 @@ async def post_init(application):
     logger.info("Self-ping background task initialized.")
 
 def main():
-    # Fetch token from environment variable securely
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable found. Please set it in your environment/Render dashboard.")
@@ -305,6 +378,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("add_admin", add_admin_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
