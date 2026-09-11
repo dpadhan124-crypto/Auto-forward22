@@ -4,7 +4,6 @@ import asyncio
 import sqlite3
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -26,6 +25,96 @@ PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://forwardbot-cx7a.onrender.com"
 ADMIN_IDS = [8323137024, 8553702880]
 
+# SQLite Database Initialization & Setup
+DB_FILE = "bot_storage.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            topic_id INTEGER,
+            forward_mode TEXT DEFAULT 'regular',
+            step TEXT,
+            panel_message_id INTEGER
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            serial_num INTEGER,
+            file_type TEXT,
+            file_id TEXT,
+            caption TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+class SQLiteSessionManager:
+    def get_session(self, user_id):
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM sessions WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        session = dict(row) if row else None
+        
+        if session:
+            cursor.execute("SELECT * FROM files WHERE user_id = ? ORDER BY serial_num ASC", (user_id,))
+            session["files"] = [dict(f) for f in cursor.fetchall()]
+        conn.close()
+        return session
+
+    def set_session_field(self, user_id, **kwargs):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT user_id FROM sessions WHERE user_id = ?", (user_id,))
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO sessions (user_id, forward_mode) VALUES (?, 'regular')", (user_id,))
+        
+        fields = []
+        values = []
+        for k, v in kwargs.items():
+            fields.append(f"{k} = ?")
+            values.append(v)
+        
+        if fields:
+            values.append(user_id)
+            cursor.execute(f"UPDATE sessions SET {', '.join(fields)} WHERE user_id = ?", values)
+            
+        conn.commit()
+        conn.close()
+
+    def add_file(self, user_id, file_type, file_id, caption):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,))
+        count = cursor.fetchone()[0]
+        serial_num = count + 1
+        
+        cursor.execute('''
+            INSERT INTO files (user_id, serial_num, file_type, file_id, caption)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, serial_num, file_type, file_id, caption))
+        conn.commit()
+        conn.close()
+
+    def clear_session(self, user_id):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM files WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+user_sessions = SQLiteSessionManager()
+
 # Flask App Initialization for UptimeRobot / Ping Web Server Fix
 flask_app = Flask(__name__)
 
@@ -45,77 +134,110 @@ def admin_required(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# Lightweight Database Setup (SQLite) with strict sequential message sorting
-class LocalDB:
-    def __init__(self, db_name="bot_storage.db"):
-        self.db_name = db_name
-        self.init_db()
-
-    def get_connection(self):
-        return sqlite3.connect(self.db_name)
-
-    def init_db(self):
-        with self.get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scanned_files (
-                    user_id INTEGER,
-                    channel_id TEXT,
-                    msg_id INTEGER,
-                    serial_num INTEGER,
-                    file_type TEXT,
-                    file_id TEXT,
-                    caption TEXT,
-                    PRIMARY KEY(user_id, channel_id, msg_id)
-                )
-            """)
-            conn.commit()
-
-    def save_file(self, user_id, channel_id, msg_id, serial_num, file_type, file_id, caption):
-        with self.get_connection() as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO scanned_files 
-                (user_id, channel_id, msg_id, serial_num, file_type, file_id, caption)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (user_id, str(channel_id), msg_id, serial_num, file_type, file_id, caption))
-            conn.commit()
-
-    def get_files(self, user_id, channel_id):
-        with self.get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT msg_id, serial_num, file_type, file_id, caption FROM scanned_files 
-                WHERE user_id = ? AND channel_id = ? 
-                ORDER BY serial_num ASC
-            """, (user_id, str(channel_id)))
-            return [{"msg_id": row[0], "serial_num": row[1], "type": row[2], "file_id": row[3], "caption": row[4]} for row in cursor.fetchall()]
-
-    def clear_data(self, user_id, channel_id):
-        with self.get_connection() as conn:
-            conn.execute("DELETE FROM scanned_files WHERE user_id = ? AND channel_id = ?", (user_id, str(channel_id)))
-            conn.commit()
-
-db = LocalDB()
-
-# State and Quest Management
-user_sessions = {}
-user_queues = {}     # user_id -> asyncio.Queue() of channel inputs
-user_processing = {} # user_id -> bool flag indicating active task
-quest_stats = {}     # user_id -> list of quests
-
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("📁 By chat_id", callback_data="mode_chat_id")],
-        [InlineKeyboardButton("📁 By topic_id", callback_data="mode_topic_id")],
-        [InlineKeyboardButton("📊 Stats", callback_data="show_stats")]
+        [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    target_chat = update.message or update.callback_query.message
-    await target_chat.reply_text(
-        "Welcome Admin! Choose how you would like to configure your file routing:",
+    await update.message.reply_text(
+        "Welcome Admin! Choose an option above to add the bots, or click **Forward** to start the process.",
         reply_markup=reply_markup
     )
+
+@admin_required
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_state = user_sessions.get_session(user_id) or {}
+    step = user_state.get("step")
+
+    if step == "awaiting_channel":
+        channel_input = update.message.text.strip()
+        if channel_input.isdigit():
+            channel_input = f"-100{channel_input}"
+
+        try:
+            chat = await context.bot.get_chat(channel_input)
+            channel_name = chat.title
+            
+            topic = await context.bot.create_forum_topic(
+                chat_id=DESTINATION_GROUP_ID,
+                name=channel_name
+            )
+            
+            user_sessions.set_session_field(
+                user_id,
+                step="collecting_files",
+                topic_id=topic.message_thread_id,
+                forward_mode="regular"
+            )
+            await send_control_panel(update, context, user_id)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error accessing channel: {e}")
+    
+    elif step == "collecting_files":
+        msg = update.message
+        file_id = None
+        f_type = "document"
+
+        if msg.document:
+            file_id, f_type = msg.document.file_id, "document"
+        elif msg.video:
+            file_id, f_type = msg.video.file_id, "video"
+        elif msg.photo:
+            file_id, f_type = msg.photo[-1].file_id, "photo"
+        elif msg.audio:
+            file_id, f_type = msg.audio.file_id, "audio"
+
+        if file_id:
+            user_sessions.add_file(user_id, f_type, file_id, msg.caption or "")
+            await msg.delete()
+            await update_control_panel(update, context, user_id)
+
+async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    state = user_sessions.get_session(user_id)
+    text, reply_markup = get_panel_content(state)
+    sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    try:
+        await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id)
+    except Exception:
+        pass
+    user_sessions.set_session_field(user_id, panel_message_id=sent_msg.message_id)
+
+async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    state = user_sessions.get_session(user_id)
+    if not state:
+        return
+    text, reply_markup = get_panel_content(state)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=state["panel_message_id"],
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+def get_panel_content(state):
+    topic_id = state.get("topic_id")
+    mode = state.get("forward_mode", "regular")
+    total_files = len(state.get("files", []))
+    text = (
+        f"⚙️ **Configuration Panel**\n\n"
+        f"• **Group topic id:** `{topic_id}`\n"
+        f"• **Forward mode:** `{mode}`\n"
+        f"• **Total file saved:** `{total_files}`\n\n"
+        f"*(Send files to queue them with serial numbers)*"
+    )
+    keyboard = [
+        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
+        [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,74 +245,39 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
 
-    if query.data == "mode_chat_id":
-        user_sessions[user_id] = {"step": "awaiting_chat_id"}
-        if user_id not in user_queues:
-            user_queues[user_id] = asyncio.Queue()
-        await query.message.reply_text(
-            "Please send your source **Channel ID(s)** or username(s).\n"
-            "If a scan is already running, additional channels will be safely queued as Quests!"
-        )
+    if query.data == "start_forward":
+        user_sessions.set_session_field(user_id, step="awaiting_channel")
+        await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).")
+        return
 
-    elif query.data == "mode_topic_id":
-        user_sessions[user_id] = {"step": "awaiting_topic_id"}
-        await query.message.reply_text("Please send the numeric **Topic ID** of the existing destination group topic:")
+    state = user_sessions.get_session(user_id)
+    if not state:
+        await query.edit_message_text("Session expired. Send `/start` to begin again.")
+        return
 
-    elif query.data == "show_stats":
-        stats = quest_stats.get(user_id, [])
-        if not stats:
-            await query.message.reply_text("📊 **Quest Stats:**\n\nNo active quests or processing queues found right now.", parse_mode="Markdown")
-        else:
-            text = "📊 **Active Quest Processing Stats:**\n\n"
-            for idx, q in enumerate(stats, 1):
-                text += f"• **Quest {idx}:** Channel `{q['channel_name']}` (`{q['channel_id']}`) | Topic ID: `{q['topic_id']}` | Status: `{q['status']}`\n"
-            await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif query.data == "toggle_mode":
-        state = user_sessions.get(user_id)
-        if state:
-            state["forward_mode"] = "reverse_order" if state.get("forward_mode", "reverse_order") == "regular" else "regular"
-            user_sessions[user_id] = state
-            await update_control_panel(update, context, user_id)
+    if query.data == "toggle_mode":
+        new_mode = "reverse_order" if state.get("forward_mode") == "regular" else "regular"
+        user_sessions.set_session_field(user_id, forward_mode=new_mode)
+        await update_control_panel(update, context, user_id)
 
     elif query.data == "finish_process":
-        state = user_sessions.get(user_id)
-        if not state:
-            try:
-                await query.edit_message_text("⚠️ Session expired.")
-            except Exception:
-                pass
-            return
-
-        channel_id = state.get("channel_id")
-        channel_name = state.get("channel_name", "Channel")
-        topic_id = state["topic_id"]
-        mode = state.get("forward_mode", "reverse_order")
-        files = db.get_files(user_id, channel_id)
-        total_files = len(files)
+        files = state.get("files", [])
+        topic_id = state.get("topic_id")
+        mode = state.get("forward_mode", "regular")
 
         if not files:
-            try:
-                await query.edit_message_text("⚠️ No files found to send.")
-            except Exception:
-                pass
-            db.clear_data(user_id, channel_id)
-            user_sessions.pop(user_id, None)
-            user_processing[user_id] = False
-            await check_and_run_next_queue(update, context, user_id)
+            await query.edit_message_text("⚠️ No files saved to send.")
+            user_sessions.clear_session(user_id)
             return
 
-        try:
-            await query.edit_message_text(f"⚡ Dispatching files sequentially by serial number to topic `{topic_id}`...")
-        except Exception:
-            pass
+        await query.edit_message_text("⚡ Processing and dispatching files preserving serial order...")
 
         if mode == "reverse_order":
             files.reverse()
 
         tasks = []
         for file_info in files:
-            f_type = file_info["type"]
+            f_type = file_info["file_type"]
             f_id = file_info["file_id"]
             caption = file_info["caption"]
 
@@ -208,242 +295,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunk = tasks[i:i + chunk_size]
             await asyncio.gather(*chunk, return_exceptions=True)
 
-        # Update quest stats status
-        if user_id in quest_stats:
-            for q in quest_stats[user_id]:
-                if str(q["channel_id"]) == str(channel_id):
-                    q["status"] = "Completed"
-
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id, 
-            text=f"Set to Quest 1...{total_files}\n✅ All files for channel `{channel_name}` dispatched successfully by serial number!",
-            parse_mode="Markdown"
-        )
-        db.clear_data(user_id, channel_id)
-        user_sessions.pop(user_id, None)
-        user_processing[user_id] = False
-
-        # Process next queued quest if available
-        await check_and_run_next_queue(update, context, user_id)
-
-@admin_required
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_state = user_sessions.get(user_id) or {}
-    step = user_state.get("step")
-
-    if step == "awaiting_chat_id":
-        channel_input = update.message.text.strip()
-        if channel_input.isdigit():
-            channel_input = f"-100{channel_input}"
-
-        if user_id not in user_queues:
-            user_queues[user_id] = asyncio.Queue()
-
-        if user_processing.get(user_id, False):
-            await user_queues[user_id].put(channel_input)
-            await update.message.reply_text(f"📥 Channel `{channel_input}` is currently busy. Added to processing queue as a new Quest.", parse_mode="Markdown")
-        else:
-            user_processing[user_id] = True
-            asyncio.create_task(process_channel_workflow(update, context, user_id, channel_input))
-
-    elif step == "awaiting_topic_id":
-        topic_input = update.message.text.strip()
-        if not topic_input.isdigit():
-            await update.message.reply_text("❌ Topic ID must be numeric. Please try again:")
-            return
-        
-        topic_id = int(topic_input)
-        user_state["topic_id"] = topic_id
-        user_state["step"] = "awaiting_channel_for_topic"
-        user_sessions[user_id] = user_state
-        await update.message.reply_text("Now send the source **Channel ID** to scan and copy all files into this topic:")
-
-    elif step == "awaiting_channel_for_topic":
-        channel_input = update.message.text.strip()
-        if channel_input.isdigit():
-            channel_input = f"-100{channel_input}"
-
-        topic_id = user_state["topic_id"]
-        if user_processing.get(user_id, False):
-            await user_queues[user_id].put(channel_input)
-            await update.message.reply_text(f"📥 Channel `{channel_input}` added to processing queue as a new Quest.", parse_mode="Markdown")
-        else:
-            user_processing[user_id] = True
-            asyncio.create_task(process_channel_workflow(update, context, user_id, channel_input, predefined_topic_id=topic_id))
-
-async def process_channel_workflow(update, context, user_id, channel_input, predefined_topic_id=None):
-    status_msg = await update.message.reply_text(f"🔄 Accessing channel `{channel_input}` for Quest setup...")
-    try:
-        chat = await context.bot.get_chat(channel_input)
-        channel_id = chat.id
-        channel_name = chat.title
-
-        if predefined_topic_id:
-            topic_id = predefined_topic_id
-        else:
-            topic = await context.bot.create_forum_topic(
-                chat_id=DESTINATION_GROUP_ID,
-                name=channel_name
-            )
-            topic_id = topic.message_thread_id
-
-        # Register / Update quest stats tracker
-        if user_id not in quest_stats:
-            quest_stats[user_id] = []
-        
-        # Check if already exists in quest stats, else append
-        existing_quest = next((q for q in quest_stats[user_id] if str(q["channel_id"]) == str(channel_id)), None)
-        if not existing_quest:
-            quest_stats[user_id].append({
-                "channel_id": str(channel_id),
-                "channel_name": channel_name,
-                "topic_id": topic_id,
-                "status": "Scanning"
-            })
-        else:
-            existing_quest["status"] = "Scanning"
-
-        await status_msg.edit_text(f"🔍 Scanning channel `{channel_name}` strictly in order by serial number... Please wait.")
-        
-        await scan_channel_files_safely(context, channel_id, user_id)
-
-        user_sessions[user_id] = {
-            "step": "review_files",
-            "topic_id": topic_id,
-            "channel_id": str(channel_id),
-            "channel_name": channel_name,
-            "forward_mode": "reverse_order"
-        }
-
-        await status_msg.delete()
-        await send_scan_summary(update, context, user_id)
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error processing channel `{channel_input}`: {e}")
-        user_processing[user_id] = False
-        await check_and_run_next_queue(update, context, user_id)
-
-async def check_and_run_next_queue(update, context, user_id):
-    if user_id in user_queues and not user_queues[user_id].empty():
-        next_channel = await user_queues[user_id].get()
-        user_processing[user_id] = True
-        asyncio.create_task(process_channel_workflow(update, context, user_id, next_channel))
-
-async def scan_channel_files_safely(context, channel_id, admin_user_id):
-    low, high = 1, 500000
-    max_id = 0
-
-    while low <= high:
-        mid = (low + high) // 2
-        try:
-            test_msg = await context.bot.forward_message(chat_id=admin_user_id, from_chat_id=channel_id, message_id=mid)
-            await test_msg.delete()
-            max_id = mid
-            low = mid + 1
-        except Exception:
-            high = mid - 1
-
-    if max_id == 0:
-        return
-
-    chunk_size = 20
-    serial_counter = 1
-    for i in range(1, max_id + 1, chunk_size):
-        chunk_end = min(i + chunk_size, max_id + 1)
-        tasks = [async_extract_file(context, channel_id, admin_user_id, msg_id) for msg_id in range(i, chunk_end)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, tuple) and res:
-                msg_id, f_type, file_id, caption = res
-                db.save_file(admin_user_id, channel_id, msg_id, serial_counter, f_type, file_id, caption)
-                serial_counter += 1
-
-async def async_extract_file(context, channel_id, admin_user_id, msg_id):
-    try:
-        fwd = await context.bot.forward_message(chat_id=admin_user_id, from_chat_id=channel_id, message_id=msg_id)
-        msg = fwd
-        file_id, f_type = None, "document"
-
-        if msg.document:
-            file_id, f_type = msg.document.file_id, "document"
-        elif msg.video:
-            file_id, f_type = msg.video.file_id, "video"
-        elif msg.photo:
-            file_id, f_type = msg.photo[-1].file_id, "photo"
-        elif msg.audio:
-            file_id, f_type = msg.audio.file_id, "audio"
-
-        caption = msg.caption or ""
-        await fwd.delete()
-
-        if file_id:
-            return (msg_id, f_type, file_id, caption)
-    except Exception:
-        pass
-    return None
-
-async def send_scan_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get(user_id)
-    if not state:
-        return
-    channel_name = state.get("channel_name", "Channel")
-    channel_id = state["channel_id"]
-    topic_id = state["topic_id"]
-    files = db.get_files(user_id, channel_id)
-    total_files = len(files)
-    mode = state.get("forward_mode", "reverse_order")
-
-    text = (
-        f"⚙️ **Configuration Panel**\n\n"
-        f"• Source Channel: {channel_name} (`{channel_id}`)\n"
-        f"• Group topic ID: `{topic_id}`\n"
-        f"• Forward mode: `{mode}`\n"
-        f"• Total files : `{total_files}`"
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
-        [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
-    ]
-    chat_id = update.effective_chat.id
-    sent_msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    state["panel_message_id"] = sent_msg.message_id
-    state["panel_chat_id"] = chat_id
-    user_sessions[user_id] = state
-
-async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get(user_id)
-    if not state or "panel_message_id" not in state:
-        return
-    channel_name = state.get("channel_name", "Channel")
-    channel_id = state["channel_id"]
-    topic_id = state["topic_id"]
-    files = db.get_files(user_id, channel_id)
-    total_files = len(files)
-    mode = state.get("forward_mode", "reverse_order")
-
-    text = (
-        f"⚙️ **Configuration Panel**\n\n"
-        f"• Source Channel: {channel_name} (`{channel_id}`)\n"
-        f"• Group topic ID: `{topic_id}`\n"
-        f"• Forward mode: `{mode}`\n"
-        f"• Total files : `{total_files}`"
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
-        [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
-    ]
-    try:
-        await context.bot.edit_message_text(
-            chat_id=state["panel_chat_id"],
-            message_id=state["panel_message_id"],
-            text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    except BadRequest as e:
-        if "Message is not modified" not in str(e):
-            logger.error(f"Failed to update panel: {e}")
+        await context.bot.send_message(chat_id=user_id, text="✅ All files dispatched with correct serial positioning. Session records and cases deleted successfully!")
+        user_sessions.clear_session(user_id)
 
 def main():
     if not TOKEN:
@@ -459,6 +312,7 @@ def main():
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
         update = Update.de_json(request.get_json(force=True), app.bot)
+        
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
