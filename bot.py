@@ -223,7 +223,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
 
-        # Save channel input temporarily in session and ask for mode & done button confirmation
         db.set_session(user_id, channel_input=channel_input, step="awaiting_mode_confirmation")
         
         keyboard = [
@@ -251,20 +250,20 @@ async def run_channel_scanner(bot, task_id):
 
     msg_id = 1
     consecutive_misses = 0
-    max_misses = 40  # Increased threshold to avoid stopping too early on sparse or missing gaps
+    max_misses = 60  # Higher tolerance for gaps in channels
     total_files = 0
 
     logger.info(f"Starting auto-scan for task {task_id} ({channel_id})")
 
     while consecutive_misses < max_misses:
         try:
-            # Force copy/forward message to destination topic or fallback test chat
-            # Since bot is admin in channel, copy_message works reliably for pulling media/content without failing on restricted channels if permissions permit
+            # We copy message cleanly to user id temporarily or check metadata via copy
+            # Alternatively, we can use forward_message or get chat history handling methods.
+            # Using copy_message to user chat temporary storage to verify file/media content safely:
             forwarded = None
             try:
                 forwarded = await bot.copy_message(
-                    chat_id=DESTINATION_GROUP_ID,
-                    message_thread_id=topic_id,
+                    chat_id=user_id,
                     from_chat_id=channel_id,
                     message_id=msg_id
                 )
@@ -272,9 +271,31 @@ async def run_channel_scanner(bot, task_id):
                 pass
 
             if forwarded:
-                total_files += 1
-                db.add_scanned_file(task_id, total_files, "copied", str(forwarded.message_id), "")
-                consecutive_misses = 0
+                consecutive_misses = 0  # Reset miss counter since message exists
+                f_type = "document"
+                file_id = None
+                caption = forwarded.caption or forwarded.text or ""
+
+                if forwarded.document:
+                    file_id, f_type = forwarded.document.file_id, "document"
+                elif forwarded.video:
+                    file_id, f_type = forwarded.video.file_id, "video"
+                elif forwarded.photo:
+                    file_id, f_type = forwarded.photo[-1].file_id, "photo"
+                elif forwarded.audio:
+                    file_id, f_type = forwarded.audio.file_id, "audio"
+                elif forwarded.text:
+                    file_id, f_type = str(msg_id), "text" # handles text-only posts safely
+
+                # Clean up temporary inspection message from user DM
+                try:
+                    await forwarded.delete()
+                except Exception:
+                    pass
+
+                if file_id:
+                    total_files += 1
+                    db.add_scanned_file(task_id, total_files, f_type, file_id, caption)
             else:
                 consecutive_misses += 1
 
@@ -284,12 +305,41 @@ async def run_channel_scanner(bot, task_id):
 
         db.update_task_progress(task_id, msg_id, total_files)
         msg_id += 1
-        await asyncio.sleep(0.05) # High-speed concurrent throttling
+        await asyncio.sleep(0.04)
 
-    # Finished scanning via direct copy stream or fallback collection
+    # Scanning finished, now dispatch files into the group topic
+    db.update_task_progress(task_id, msg_id - 1, total_files, status="Dispatching")
+    files = db.get_task_files(task_id)
+
+    if forward_mode == "reverse_order":
+        files.reverse()
+
+    tasks = []
+    for f in files:
+        f_type = f["file_type"]
+        f_id = f["file_id"]
+        caption = f["caption"]
+
+        if f_type == "document":
+            tasks.append(bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
+        elif f_type == "video":
+            tasks.append(bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption))
+        elif f_type == "photo":
+            tasks.append(bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption))
+        elif f_type == "audio":
+            tasks.append(bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
+        elif f_type == "text":
+            tasks.append(bot.send_message(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, text=caption))
+
+    chunk_size = 10
+    for i in range(0, len(tasks), chunk_size):
+        chunk = tasks[i:i + chunk_size]
+        await asyncio.gather(*chunk, return_exceptions=True)
+        await asyncio.sleep(0.3)
+
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Completed")
     try:
-        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} scan completed! Total files/messages processed & forwarded: `{total_files}`.")
+        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} completely scanned and dispatched to topic! Total items: `{total_files}`.")
     except Exception:
         pass
 
@@ -348,7 +398,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(
                 f"✅ Channel **{channel_name}** verified & locked!\n"
                 f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
-                f"⚡ Forceful background auto-scan initiated from ID 1 upwards. Check **📜 Quest Status** for live progress."
+                f"⚡ Forceful background auto-scan initiated. Check **📜 Quest Status** for live updates."
             )
             
             asyncio.create_task(run_channel_scanner(context.bot, task_id))
