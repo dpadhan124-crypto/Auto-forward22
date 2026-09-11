@@ -45,7 +45,7 @@ def admin_required(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# Lightweight Database Setup (SQLite - zero external configuration required)
+# Lightweight Database Setup (SQLite)
 class LocalDB:
     def __init__(self, db_name="bot_storage.db"):
         self.db_name = db_name
@@ -94,9 +94,10 @@ class LocalDB:
 
 db = LocalDB()
 
-# In-memory session and processing queues for multi-channel ordering
+# State and Quest Management
 user_sessions = {}
 user_queues = {}
+quest_stats = {}  # user_id -> list of active quests info
 
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,7 +105,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("📁 By chat_id", callback_data="mode_chat_id")],
-        [InlineKeyboardButton("📁 By topic_id", callback_data="mode_topic_id")]
+        [InlineKeyboardButton("📁 By topic_id", callback_data="mode_topic_id")],
+        [InlineKeyboardButton("📊 Stats", callback_data="show_stats")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     target_chat = update.message or update.callback_query.message
@@ -121,15 +123,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "mode_chat_id":
         user_sessions[user_id] = {"step": "awaiting_chat_id"}
-        user_queues[user_id] = asyncio.Queue()
+        if user_id not in user_queues:
+            user_queues[user_id] = asyncio.Queue()
         await query.message.reply_text(
             "Please send your source **Channel ID(s)** or username(s).\n"
-            "You can send multiple channels one by one; they will be processed sequentially!"
+            "You can send multiple channels one by one; they will be processed sequentially as Quests!"
         )
 
     elif query.data == "mode_topic_id":
         user_sessions[user_id] = {"step": "awaiting_topic_id"}
         await query.message.reply_text("Please send the numeric **Topic ID** of the existing destination group topic:")
+
+    elif query.data == "show_stats":
+        stats = quest_stats.get(user_id, [])
+        if not stats:
+            await query.message.reply_text("📊 **Quest Stats:**\n\nNo active quests or processing queues found right now.", parse_mode="Markdown")
+        else:
+            text = "📊 **Active Quest Processing Stats:**\n\n"
+            for idx, q in enumerate(stats, 1):
+                text += f"• **Quest {idx}:** Channel `{q['channel_name']}` (`{q['channel_id']}`) | Topic: `{q['topic_id']}` | Status: `{q['status']}`\n"
+            await query.message.reply_text(text, parse_mode="Markdown")
 
     elif query.data == "toggle_mode":
         state = user_sessions.get(user_id)
@@ -148,9 +161,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         channel_id = state.get("channel_id")
+        channel_name = state.get("channel_name", "Channel")
         topic_id = state["topic_id"]
         mode = state.get("forward_mode", "regular")
         files = db.get_files(user_id, channel_id)
+        total_files = len(files)
 
         if not files:
             try:
@@ -162,7 +177,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            await query.edit_message_text("⚡ Dispatching all scanned files to the topic at high speed...")
+            await query.edit_message_text(f"⚡ Dispatching all scanned files for quest to topic `{topic_id}`...")
         except Exception:
             pass
 
@@ -189,11 +204,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunk = tasks[i:i + chunk_size]
             await asyncio.gather(*chunk, return_exceptions=True)
 
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ All files dispatched successfully! Database cleared.")
+        # Update quest stats
+        if user_id in quest_stats:
+            for q in quest_stats[user_id]:
+                if str(q["channel_id"]) == str(channel_id):
+                    q["status"] = "Completed"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text=f"Set to Quest 1...{total_files}\n✅ All files for channel `{channel_name}` dispatched successfully! Database cleared.",
+            parse_mode="Markdown"
+        )
         db.clear_data(user_id, channel_id)
         user_sessions.pop(user_id, None)
 
-        # Process next queued channel if available
+        # Process next queued channel quest if available
         if user_id in user_queues and not user_queues[user_id].empty():
             next_channel = await user_queues[user_id].get()
             asyncio.create_task(process_channel_workflow(update, context, user_id, next_channel))
@@ -214,7 +239,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if user_sessions.get(user_id, {}).get("processing"):
             await user_queues[user_id].put(channel_input)
-            await update.message.reply_text(f"📥 Channel `{channel_input}` added to processing queue.", parse_mode="Markdown")
+            await update.message.reply_text(f"📥 Channel `{channel_input}` added to processing queue as a new Quest.", parse_mode="Markdown")
         else:
             user_sessions[user_id]["processing"] = True
             asyncio.create_task(process_channel_workflow(update, context, user_id, channel_input))
@@ -265,7 +290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_manual_panel(update, context, user_id)
 
 async def process_channel_workflow(update, context, user_id, channel_input, predefined_topic_id=None):
-    status_msg = await update.message.reply_text(f"🔄 Accessing channel `{channel_input}`...")
+    status_msg = await update.message.reply_text(f"🔄 Accessing channel `{channel_input}` for Quest...")
     try:
         chat = await context.bot.get_chat(channel_input)
         channel_id = chat.id
@@ -280,20 +305,26 @@ async def process_channel_workflow(update, context, user_id, channel_input, pred
             )
             topic_id = topic.message_thread_id
 
+        # Track quest stats
+        if user_id not in quest_stats:
+            quest_stats[user_id] = []
+        quest_stats[user_id].append({
+            "channel_id": str(channel_id),
+            "channel_name": channel_name,
+            "topic_id": topic_id,
+            "status": "Scanning"
+        })
+
         await status_msg.edit_text(f"🔍 Scanning channel `{channel_name}` strictly in order (ID 1 onwards)... Please wait.")
         
-        # Scan files sequentially or in clean batches to avoid UI blinking
-        await scan_channel_files_safely(context, channel_id, user_id, status_msg)
-
-        files = db.get_files(user_id, channel_id)
-        total_files = len(files)
+        await scan_channel_files_safely(context, channel_id, user_id)
 
         user_sessions[user_id] = {
             "step": "review_files",
             "topic_id": topic_id,
             "channel_id": str(channel_id),
             "channel_name": channel_name,
-            "forward_mode": "regular",
+            "forward_mode": "reverse_order",  # default or regular
             "processing": False
         }
 
@@ -304,13 +335,11 @@ async def process_channel_workflow(update, context, user_id, channel_input, pred
         await status_msg.edit_text(f"❌ Error processing channel `{channel_input}`: {e}")
         user_sessions[user_id]["processing"] = False
         
-        # Process next queue item if available
         if user_id in user_queues and not user_queues[user_id].empty():
             next_channel = await user_queues[user_id].get()
             asyncio.create_task(process_channel_workflow(update, context, user_id, next_channel))
 
-async def scan_channel_files_safely(context, channel_id, admin_user_id, status_msg):
-    # Binary search to find max message ID
+async def scan_channel_files_safely(context, channel_id, admin_user_id):
     low, high = 1, 500000
     max_id = 0
 
@@ -327,7 +356,6 @@ async def scan_channel_files_safely(context, channel_id, admin_user_id, status_m
     if max_id == 0:
         return
 
-    # Sequential/batched scan with strict ordering preserved via sqlite storage (`ORDER BY msg_id ASC`)
     chunk_size = 20
     for i in range(1, max_id + 1, chunk_size):
         chunk_end = min(i + chunk_size, max_id + 1)
@@ -367,15 +395,18 @@ async def send_scan_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not state:
         return
     channel_name = state.get("channel_name", "Channel")
+    channel_id = state["channel_id"]
     topic_id = state["topic_id"]
-    files = db.get_files(user_id, state["channel_id"])
+    files = db.get_files(user_id, channel_id)
     total_files = len(files)
-    mode = state.get("forward_mode", "regular")
+    mode = state.get("forward_mode", "reverse_order")
 
     text = (
-        f"Channel name.: `{channel_name}`\n"
-        f"Create topic id: `{topic_id}`\n"
-        f"Found files: total file from id 1 to {total_files}."
+        f"⚙️ **Configuration Panel**\n\n"
+        f"• Source Channel: {channel_name} (`{channel_id}`)\n"
+        f"• Group topic ID: `{topic_id}`\n"
+        f"• Forward mode: `{mode}`\n"
+        f"• Total files : `{total_files}`"
     )
     keyboard = [
         [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
@@ -392,15 +423,18 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
     if not state or "panel_message_id" not in state:
         return
     channel_name = state.get("channel_name", "Channel")
+    channel_id = state["channel_id"]
     topic_id = state["topic_id"]
-    files = db.get_files(user_id, state["channel_id"])
+    files = db.get_files(user_id, channel_id)
     total_files = len(files)
-    mode = state.get("forward_mode", "regular")
+    mode = state.get("forward_mode", "reverse_order")
 
     text = (
-        f"Channel name.: `{channel_name}`\n"
-        f"Create topic id: `{topic_id}`\n"
-        f"Found files: total file from id 1 to {total_files}."
+        f"⚙️ **Configuration Panel**\n\n"
+        f"• Source Channel: {channel_name} (`{channel_id}`)\n"
+        f"• Group topic ID: `{topic_id}`\n"
+        f"• Forward mode: `{mode}`\n"
+        f"• Total files : `{total_files}`"
     )
     keyboard = [
         [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
