@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -207,7 +208,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.callback_query:
             try:
                 await update.callback_query.message.edit_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
-            except Exception:
+            except TelegramError:
                 await update.callback_query.message.reply_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
         else:
             await msg.reply_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
@@ -250,46 +251,41 @@ async def run_channel_scanner(bot, task_id):
 
     msg_id = 1
     consecutive_misses = 0
-    max_misses = 60  # Higher tolerance for gaps in channels
+    max_misses = 300  # High tolerance threshold for gaps and missing early indexes
     total_files = 0
 
-    logger.info(f"Starting auto-scan for task {task_id} ({channel_id})")
+    logger.info(f"Starting auto-scan collection for task {task_id} ({channel_id})")
 
     while consecutive_misses < max_misses:
         try:
-            # We copy message cleanly to user id temporarily or check metadata via copy
-            # Alternatively, we can use forward_message or get chat history handling methods.
-            # Using copy_message to user chat temporary storage to verify file/media content safely:
-            forwarded = None
-            try:
-                forwarded = await bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=channel_id,
-                    message_id=msg_id
-                )
-            except Exception:
-                pass
+            # Silently forward message to admin user DM for temporary inspection & collection
+            test_msg = await bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=channel_id,
+                message_id=msg_id,
+                disable_notification=True
+            )
 
-            if forwarded:
-                consecutive_misses = 0  # Reset miss counter since message exists
+            if test_msg:
+                consecutive_misses = 0
                 f_type = "document"
                 file_id = None
-                caption = forwarded.caption or forwarded.text or ""
+                caption = test_msg.caption or test_msg.text or ""
 
-                if forwarded.document:
-                    file_id, f_type = forwarded.document.file_id, "document"
-                elif forwarded.video:
-                    file_id, f_type = forwarded.video.file_id, "video"
-                elif forwarded.photo:
-                    file_id, f_type = forwarded.photo[-1].file_id, "photo"
-                elif forwarded.audio:
-                    file_id, f_type = forwarded.audio.file_id, "audio"
-                elif forwarded.text:
-                    file_id, f_type = str(msg_id), "text" # handles text-only posts safely
+                if test_msg.document:
+                    file_id, f_type = test_msg.document.file_id, "document"
+                elif test_msg.video:
+                    file_id, f_type = test_msg.video.file_id, "video"
+                elif test_msg.photo:
+                    file_id, f_type = test_msg.photo[-1].file_id, "photo"
+                elif test_msg.audio:
+                    file_id, f_type = test_msg.audio.file_id, "audio"
+                elif test_msg.text:
+                    file_id, f_type = str(msg_id), "text"
 
-                # Clean up temporary inspection message from user DM
+                # Delete test message immediately
                 try:
-                    await forwarded.delete()
+                    await test_msg.delete()
                 except Exception:
                     pass
 
@@ -299,15 +295,14 @@ async def run_channel_scanner(bot, task_id):
             else:
                 consecutive_misses += 1
 
-        except Exception as e:
-            logger.debug(f"Scan skip msg_id {msg_id}: {e}")
+        except Exception:
             consecutive_misses += 1
 
         db.update_task_progress(task_id, msg_id, total_files)
         msg_id += 1
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.02)
 
-    # Scanning finished, now dispatch files into the group topic
+    # Scanning phase finished, now dispatching files into destination topic
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Dispatching")
     files = db.get_task_files(task_id)
 
@@ -335,24 +330,29 @@ async def run_channel_scanner(bot, task_id):
     for i in range(0, len(tasks), chunk_size):
         chunk = tasks[i:i + chunk_size]
         await asyncio.gather(*chunk, return_exceptions=True)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Completed")
     try:
-        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} completely scanned and dispatched to topic! Total items: `{total_files}`.")
+        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} completely scanned and dispatched! Total items: `{total_files}`.")
     except Exception:
         pass
 
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Answer query instantly to prevent double-tap lags
     await query.answer()
+    
     user_id = query.from_user.id
     session = db.get_session(user_id) or {}
 
     if query.data == "start_forward":
         db.set_session(user_id, step="awaiting_channel", forward_mode="regular")
-        await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).")
+        try:
+            await query.message.edit_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).", parse_mode="Markdown")
+        except TelegramError:
+            await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).", parse_mode="Markdown")
         return
 
     elif query.data == "set_mode_regular":
@@ -362,7 +362,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("Mode: Reverse", callback_data="set_mode_reverse")],
             [InlineKeyboardButton("✅ Done / Start Scan", callback_data="confirm_scan_start")]
         ]
-        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except TelegramError:
+            pass
         return
 
     elif query.data == "set_mode_reverse":
@@ -372,7 +375,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("Mode: Reverse ✅", callback_data="set_mode_reverse")],
             [InlineKeyboardButton("✅ Done / Start Scan", callback_data="confirm_scan_start")]
         ]
-        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except TelegramError:
+            pass
         return
 
     elif query.data == "confirm_scan_start":
@@ -381,7 +387,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.clear_session(user_id)
 
         if not channel_input:
-            await query.message.edit_text("⚠️ Session expired or channel missing. Please start over with `/start`.")
+            try:
+                await query.message.edit_text("⚠️ Session expired or channel missing. Please start over with `/start`.")
+            except TelegramError:
+                pass
             return
 
         try:
@@ -395,16 +404,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             task_id = db.create_task(user_id, channel_input, channel_name, topic.message_thread_id, forward_mode)
             
-            await query.message.edit_text(
-                f"✅ Channel **{channel_name}** verified & locked!\n"
-                f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
-                f"⚡ Forceful background auto-scan initiated. Check **📜 Quest Status** for live updates."
-            )
+            try:
+                await query.message.edit_text(
+                    f"✅ Channel **{channel_name}** verified & locked!\n"
+                    f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
+                    f"⚡ Forceful background auto-scan initiated. Check **📜 Quest Status** for live updates.",
+                    parse_mode="Markdown"
+                )
+            except TelegramError:
+                pass
             
             asyncio.create_task(run_channel_scanner(context.bot, task_id))
 
         except Exception as e:
-            await query.message.edit_text(f"❌ Error initiating channel scan: {e}")
+            try:
+                await query.message.edit_text(f"❌ Error initiating channel scan: {e}")
+            except TelegramError:
+                pass
         return
 
     elif query.data == "show_quests":
@@ -415,7 +431,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
         ]
         if not tasks:
-            await query.message.edit_text("📜 No active or completed quests found.", reply_markup=InlineKeyboardMarkup(keyboard))
+            try:
+                await query.message.edit_text("📜 No active or completed quests found.", reply_markup=InlineKeyboardMarkup(keyboard))
+            except TelegramError:
+                pass
             return
 
         text = "📜 **Quest System Status**\n\n"
@@ -426,13 +445,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"• Scanned Msg ID: `{t['current_msg_id']}` | Files Found: `{t['total_files']}`\n"
             text += f"• Mode: `{t['forward_mode']}`\n\n"
 
-        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        except TelegramError:
+            pass
         return
 
     elif query.data == "clear_database":
         db.clear_all_database()
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]
-        await query.message.edit_text("🗑️ Database successfully cleared and all task history wiped!", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.message.edit_text("🗑️ Database successfully cleared and all task history wiped!", reply_markup=InlineKeyboardMarkup(keyboard))
+        except TelegramError:
+            pass
         return
 
     elif query.data == "back_to_start":
