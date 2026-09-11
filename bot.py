@@ -55,7 +55,6 @@ class LocalBrowserStorage:
         return self.store.get(user_id)
 
     def set(self, user_id, data):
-        # Enforce simulated browser 5MB threshold check
         import sys
         approx_size = sys.getsizeof(str(self.store))
         if approx_size >= self.max_size:
@@ -214,7 +213,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mode == "reverse_order":
             files.reverse()
 
-        # Speed Optimization: Concurrently dispatch files using asyncio.gather
         tasks = []
         for file_info in files:
             f_type = file_info["type"]
@@ -230,7 +228,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif f_type == "audio":
                 tasks.append(context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
 
-        # Run chunks concurrently to maximize throughput without hitting rate limits instantly
         chunk_size = 10
         for i in range(0, len(tasks), chunk_size):
             chunk = tasks[i:i + chunk_size]
@@ -250,11 +247,18 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
 
-    # Setup Webhook configuration route on Flask server
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
         update = Update.de_json(request.get_json(force=True), app.bot)
-        asyncio.run(app.process_update(update))
+        
+        # Safely run the update processing across thread boundaries for Python 3.14 compatibility
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        loop.run_until_complete(app.process_update(update))
         return "OK", 200
 
     async def setup_webhook():
@@ -264,7 +268,14 @@ def main():
         logger.info(f"Webhook set successfully to {webhook_full_url}")
         await app.start()
 
-    asyncio.get_event_loop().run_until_complete(setup_webhook())
+    # Safely initiate the event loop for Python 3.14+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    loop.run_until_complete(setup_webhook())
 
     logger.info(f"Starting web server on port {PORT}...")
     flask_app.run(host="0.0.0.0", port=PORT)
