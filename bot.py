@@ -3,6 +3,7 @@ import logging
 import asyncio
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -110,7 +111,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
             await send_control_panel(update, context, user_id)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}")
+            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}\nMake sure the bot is an admin in the channel and destination group.")
 
     elif step == "awaiting_existing_topic":
         topic_input = update.message.text.strip()
@@ -148,25 +149,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "caption": msg.caption or ""
             })
             user_sessions.set(user_id, user_state)
-            await msg.delete()
+            try:
+                await msg.delete()
+            except Exception:
+                pass
             await update_control_panel(update, context, user_id)
 
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     state = user_sessions.get(user_id)
     text, reply_markup = get_panel_content(state)
     
-    # Send message using context.bot to handle both message updates and callback query contexts smoothly
     sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    
+    # Pin configuration panel message securely
     try:
-        await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id)
-    except Exception:
-        pass
+        await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id, disable_notification=True)
+    except Exception as e:
+        logger.error(f"Could not pin configuration message: {e}")
+        
     state["panel_message_id"] = sent_msg.message_id
     user_sessions.set(user_id, state)
 
 async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     state = user_sessions.get(user_id)
-    if not state:
+    if not state or "panel_message_id" not in state:
         return
     text, reply_markup = get_panel_content(state)
     try:
@@ -177,8 +183,12 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-    except Exception:
-        pass
+    except BadRequest as e:
+        # Ignore errors if content has not changed to prevent button freezing
+        if "Message is not modified" not in str(e):
+            logger.error(f"Failed to update control panel: {e}")
+    except Exception as e:
+        logger.error(f"Failed to update control panel: {e}")
 
 def get_panel_content(state):
     topic_id = state.get("topic_id")
@@ -218,7 +228,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = user_sessions.get(user_id)
     if not state:
-        await query.edit_message_text("Session expired. Send `/start` to begin again.")
+        try:
+            await query.edit_message_text("Session expired. Send `/start` to begin again.")
+        except Exception:
+            pass
         return
 
     if query.data == "toggle_mode":
@@ -232,11 +245,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = state["forward_mode"]
 
         if not files:
-            await query.edit_message_text("⚠️ No files saved to send.")
+            try:
+                await query.edit_message_text("⚠️ No files saved to send.")
+            except Exception:
+                pass
             user_sessions.pop(user_id, None)
             return
 
-        await query.edit_message_text("⚡ Processing and dispatching files concurrently at high speed...")
+        try:
+            await query.edit_message_text("⚡ Processing and dispatching files concurrently at high speed...")
+        except Exception:
+            pass
 
         if mode == "reverse_order":
             files.reverse()
