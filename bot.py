@@ -71,11 +71,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
+        [InlineKeyboardButton("🆕 Create New Topic (From Channel ID)", callback_data="mode_new_topic")],
+        [InlineKeyboardButton("📁 Use Existing Topic ID", callback_data="mode_existing_topic")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Welcome Admin! Choose an option above to add the bots, or click **Forward** to start the process.",
+        "Welcome Admin! Choose how you would like to route your forwarded files:",
         reply_markup=reply_markup
     )
 
@@ -87,6 +88,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "awaiting_channel":
         channel_input = update.message.text.strip()
+        
+        # Automatically prepend -100 if channel ID is digits only without prefix
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
 
@@ -107,7 +110,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
             await send_control_panel(update, context, user_id)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error accessing channel: {e}")
+            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}")
+
+    elif step == "awaiting_existing_topic":
+        topic_input = update.message.text.strip()
+        if not topic_input.isdigit():
+            await update.message.reply_text("❌ Topic ID must be a numeric value. Please try again:")
+            return
+
+        topic_id = int(topic_input)
+        user_sessions.set(user_id, {
+            "step": "collecting_files",
+            "topic_id": topic_id,
+            "forward_mode": "regular",
+            "files": []
+        })
+        await send_control_panel(update, context, user_id)
     
     elif step == "collecting_files":
         msg = update.message
@@ -136,6 +154,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     state = user_sessions.get(user_id)
     text, reply_markup = get_panel_content(state)
+    
+    # Send message using context.bot to handle both message updates and callback query contexts smoothly
     sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
     try:
         await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id)
@@ -166,9 +186,9 @@ def get_panel_content(state):
     total_files = len(state.get("files", []))
     text = (
         f"⚙️ **Configuration Panel**\n\n"
-        f"• **Group topic id:** `{topic_id}`\n"
+        f"• **Group topic ID:** `{topic_id}`\n"
         f"• **Forward mode:** `{mode}`\n"
-        f"• **Total file saved:** `{total_files}`\n\n"
+        f"• **Total files saved:** `{total_files}`\n\n"
         f"*(Send files to add them to the queue)*"
     )
     keyboard = [
@@ -183,9 +203,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
 
-    if query.data == "start_forward":
+    if query.data == "mode_new_topic":
         user_sessions.set(user_id, {"step": "awaiting_channel"})
-        await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).")
+        await query.message.reply_text(
+            "Please send your source **Channel ID** or username (e.g., `1234567890`, `-1001234567890`, or `@mychannel`).\n"
+            "A new forum topic will automatically be created in the destination group using the channel's title."
+        )
+        return
+
+    if query.data == "mode_existing_topic":
+        user_sessions.set(user_id, {"step": "awaiting_existing_topic"})
+        await query.message.reply_text("Please send the numeric **Topic ID** of the existing destination group topic where files should be dispatched:")
         return
 
     state = user_sessions.get(user_id)
@@ -250,8 +278,6 @@ def main():
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
         update = Update.de_json(request.get_json(force=True), app.bot)
-        
-        # Safely run the update processing across thread boundaries for Python 3.14 compatibility
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -268,7 +294,6 @@ def main():
         logger.info(f"Webhook set successfully to {webhook_full_url}")
         await app.start()
 
-    # Safely initiate the event loop for Python 3.14+
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
