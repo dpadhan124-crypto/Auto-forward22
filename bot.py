@@ -26,7 +26,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "h
 ADMIN_IDS = [8323137024, 8553702880]
 
 # SQLite Database Initialization & Setup
-DB_FILE = "bot_storage.db"
+DB_FILE = "bot_quests.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -34,16 +34,28 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             user_id INTEGER PRIMARY KEY,
-            topic_id INTEGER,
+            channel_input TEXT,
             forward_mode TEXT DEFAULT 'regular',
-            step TEXT,
-            panel_message_id INTEGER
+            step TEXT
         )
     ''')
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            channel_input TEXT,
+            channel_name TEXT,
+            topic_id INTEGER,
+            forward_mode TEXT,
+            status TEXT DEFAULT 'Pending',
+            current_msg_id INTEGER DEFAULT 0,
+            total_files INTEGER DEFAULT 0
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scanned_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
             serial_num INTEGER,
             file_type TEXT,
             file_id TEXT,
@@ -55,7 +67,7 @@ def init_db():
 
 init_db()
 
-class SQLiteSessionManager:
+class DatabaseManager:
     def get_session(self, user_id):
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
@@ -63,45 +75,20 @@ class SQLiteSessionManager:
         cursor.execute("SELECT * FROM sessions WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         session = dict(row) if row else None
-        
-        if session:
-            cursor.execute("SELECT * FROM files WHERE user_id = ? ORDER BY serial_num ASC", (user_id,))
-            session["files"] = [dict(f) for f in cursor.fetchall()]
         conn.close()
         return session
 
-    def set_session_field(self, user_id, **kwargs):
+    def set_session(self, user_id, **kwargs):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
         cursor.execute("SELECT user_id FROM sessions WHERE user_id = ?", (user_id,))
         if not cursor.fetchone():
             cursor.execute("INSERT INTO sessions (user_id, forward_mode) VALUES (?, 'regular')", (user_id,))
         
-        fields = []
-        values = []
-        for k, v in kwargs.items():
-            fields.append(f"{k} = ?")
-            values.append(v)
-        
+        fields = [f"{k} = ?" for k in kwargs.keys()]
+        values = list(kwargs.values()) + [user_id]
         if fields:
-            values.append(user_id)
             cursor.execute(f"UPDATE sessions SET {', '.join(fields)} WHERE user_id = ?", values)
-            
-        conn.commit()
-        conn.close()
-
-    def add_file(self, user_id, file_type, file_id, caption):
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,))
-        count = cursor.fetchone()[0]
-        serial_num = count + 1
-        
-        cursor.execute('''
-            INSERT INTO files (user_id, serial_num, file_type, file_id, caption)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, serial_num, file_type, file_id, caption))
         conn.commit()
         conn.close()
 
@@ -109,11 +96,74 @@ class SQLiteSessionManager:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        cursor.execute("DELETE FROM files WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
 
-user_sessions = SQLiteSessionManager()
+    def create_task(self, user_id, channel_input, channel_name, topic_id, forward_mode):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO tasks (user_id, channel_input, channel_name, topic_id, forward_mode, status)
+            VALUES (?, ?, ?, ?, ?, 'Scanning')
+        ''', (user_id, channel_input, channel_name, topic_id, forward_mode))
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return task_id
+
+    def update_task_progress(self, task_id, current_msg_id, total_files, status=None):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        if status:
+            cursor.execute('''
+                UPDATE tasks SET current_msg_id = ?, total_files = ?, status = ? WHERE task_id = ?
+            ''', (current_msg_id, total_files, status, task_id))
+        else:
+            cursor.execute('''
+                UPDATE tasks SET current_msg_id = ?, total_files = ? WHERE task_id = ?
+            ''', (current_msg_id, total_files, task_id))
+        conn.commit()
+        conn.close()
+
+    def add_scanned_file(self, task_id, serial_num, file_type, file_id, caption):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO scanned_files (task_id, serial_num, file_type, file_id, caption)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (task_id, serial_num, file_type, file_id, caption))
+        conn.commit()
+        conn.close()
+
+    def get_all_tasks(self):
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tasks ORDER BY task_id ASC")
+        tasks = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return tasks
+
+    def get_task(self, task_id):
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        task = dict(row) if row else None
+        conn.close()
+        return task
+
+    def get_task_files(self, task_id):
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM scanned_files WHERE task_id = ? ORDER BY serial_num ASC", (task_id,))
+        files = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return files
+
+db = DatabaseManager()
 
 # Flask App Initialization for UptimeRobot / Ping Web Server Fix
 flask_app = Flask(__name__)
@@ -139,24 +189,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
+        [InlineKeyboardButton("➡️ Forward & Auto-Scan", callback_data="start_forward")],
+        [InlineKeyboardButton("📜 Quest Status", callback_data="show_quests")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Welcome Admin! Choose an option above to add the bots, or click **Forward** to start the process.",
-        reply_markup=reply_markup
-    )
+    msg = update.message or (update.callback_query and update.callback_query.message)
+    if msg:
+        if update.callback_query:
+            await update.callback_query.message.edit_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
+        else:
+            await msg.reply_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_state = user_sessions.get_session(user_id) or {}
-    step = user_state.get("step")
+    session = db.get_session(user_id) or {}
+    step = session.get("step")
 
     if step == "awaiting_channel":
         channel_input = update.message.text.strip()
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
+
+        forward_mode = session.get("forward_mode", "regular")
+        db.clear_session(user_id)
 
         try:
             chat = await context.bot.get_chat(channel_input)
@@ -167,77 +223,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name=channel_name
             )
             
-            user_sessions.set_session_field(
-                user_id,
-                step="collecting_files",
-                topic_id=topic.message_thread_id,
-                forward_mode="regular"
+            task_id = db.create_task(user_id, channel_input, channel_name, topic.message_thread_id, forward_mode)
+            
+            await update.message.reply_text(
+                f"✅ Channel **{channel_name}** verified!\n"
+                f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
+                f"⚡ Automatic file scanning has started in the background. Check **📜 Quest Status** for progress."
             )
-            await send_control_panel(update, context, user_id)
+            
+            # Start background scanning task
+            asyncio.create_task(run_channel_scanner(context.bot, task_id))
+
         except Exception as e:
             await update.message.reply_text(f"❌ Error accessing channel: {e}")
-    
-    elif step == "collecting_files":
-        msg = update.message
-        file_id = None
-        f_type = "document"
 
-        if msg.document:
-            file_id, f_type = msg.document.file_id, "document"
-        elif msg.video:
-            file_id, f_type = msg.video.file_id, "video"
-        elif msg.photo:
-            file_id, f_type = msg.photo[-1].file_id, "photo"
-        elif msg.audio:
-            file_id, f_type = msg.audio.file_id, "audio"
-
-        if file_id:
-            user_sessions.add_file(user_id, f_type, file_id, msg.caption or "")
-            await msg.delete()
-            await update_control_panel(update, context, user_id)
-
-async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get_session(user_id)
-    text, reply_markup = get_panel_content(state)
-    sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
-    try:
-        await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id)
-    except Exception:
-        pass
-    user_sessions.set_session_field(user_id, panel_message_id=sent_msg.message_id)
-
-async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get_session(user_id)
-    if not state:
+async def run_channel_scanner(bot, task_id):
+    task = db.get_task(task_id)
+    if not task:
         return
-    text, reply_markup = get_panel_content(state)
+
+    channel_id = task["channel_input"]
+    topic_id = task["topic_id"]
+    forward_mode = task["forward_mode"]
+    user_id = task["user_id"]
+
+    msg_id = 1
+    consecutive_misses = 0
+    max_misses = 25  # Stop after 25 consecutive missing message IDs
+    total_files = 0
+
+    logger.info(f"Starting auto-scan for task {task_id} ({task['channel_name']})")
+
+    while consecutive_misses < max_misses:
+        try:
+            # Forward message to admin chat temporarily to inspect content safely
+            test_msg = await bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=channel_id,
+                message_id=msg_id
+            )
+
+            file_id = None
+            f_type = "document"
+            caption = test_msg.caption or ""
+
+            if test_msg.document:
+                file_id, f_type = test_msg.document.file_id, "document"
+            elif test_msg.video:
+                file_id, f_type = test_msg.video.file_id, "video"
+            elif test_msg.photo:
+                file_id, f_type = test_msg.photo[-1].file_id, "photo"
+            elif test_msg.audio:
+                file_id, f_type = test_msg.audio.file_id, "audio"
+
+            # Delete the inspection message from admin chat immediately
+            try:
+                await test_msg.delete()
+            except Exception:
+                pass
+
+            if file_id:
+                total_files += 1
+                db.add_scanned_file(task_id, total_files, f_type, file_id, caption)
+
+            consecutive_misses = 0  # Reset on valid message found
+        except Exception:
+            consecutive_misses += 1
+
+        db.update_task_progress(task_id, msg_id, total_files)
+        msg_id += 1
+        await asyncio.sleep(0.1)  # Rate limiting safeguard
+
+    # Scanning completed, now dispatch files
+    db.update_task_progress(task_id, msg_id - 1, total_files, status="Dispatching")
+    files = db.get_task_files(task_id)
+
+    if forward_mode == "reverse_order":
+        files.reverse()
+
+    tasks = []
+    for f in files:
+        f_type = f["file_type"]
+        f_id = f["file_id"]
+        caption = f["caption"]
+
+        if f_type == "document":
+            tasks.append(bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
+        elif f_type == "video":
+            tasks.append(bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption))
+        elif f_type == "photo":
+            tasks.append(bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption))
+        elif f_type == "audio":
+            tasks.append(bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
+
+    chunk_size = 10
+    for i in range(0, len(tasks), chunk_size):
+        chunk = tasks[i:i + chunk_size]
+        await asyncio.gather(*chunk, return_exceptions=True)
+        await asyncio.sleep(0.5)
+
+    db.update_task_progress(task_id, msg_id - 1, total_files, status="Completed")
     try:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=state["panel_message_id"],
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} for **{task['channel_name']}** completed successfully! All files dispatched.")
     except Exception:
         pass
-
-def get_panel_content(state):
-    topic_id = state.get("topic_id")
-    mode = state.get("forward_mode", "regular")
-    total_files = len(state.get("files", []))
-    text = (
-        f"⚙️ **Configuration Panel**\n\n"
-        f"• **Group topic id:** `{topic_id}`\n"
-        f"• **Forward mode:** `{mode}`\n"
-        f"• **Total file saved:** `{total_files}`\n\n"
-        f"*(Send files to queue them with serial numbers)*"
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
-        [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
 
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,57 +335,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if query.data == "start_forward":
-        user_sessions.set_session_field(user_id, step="awaiting_channel")
+        db.set_session(user_id, step="awaiting_channel", forward_mode="regular")
         await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).")
         return
 
-    state = user_sessions.get_session(user_id)
-    if not state:
-        await query.edit_message_text("Session expired. Send `/start` to begin again.")
-        return
-
-    if query.data == "toggle_mode":
-        new_mode = "reverse_order" if state.get("forward_mode") == "regular" else "regular"
-        user_sessions.set_session_field(user_id, forward_mode=new_mode)
-        await update_control_panel(update, context, user_id)
-
-    elif query.data == "finish_process":
-        files = state.get("files", [])
-        topic_id = state.get("topic_id")
-        mode = state.get("forward_mode", "regular")
-
-        if not files:
-            await query.edit_message_text("⚠️ No files saved to send.")
-            user_sessions.clear_session(user_id)
+    elif query.data == "show_quests":
+        tasks = db.get_all_tasks()
+        if not tasks:
+            await query.message.edit_text("📜 No active or completed quests found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]))
             return
 
-        await query.edit_message_text("⚡ Processing and dispatching files preserving serial order...")
+        text = "📜 **Quest System Status**\n\n"
+        for t in tasks:
+            status_emoji = "🔄" if t["status"] == "Scanning" else ("⚡" if t["status"] == "Dispatching" else "✅")
+            text += f"**#{t['task_id']}** | 📢 {t['channel_name']}\n"
+            text += f"• Status: {status_emoji} `{t['status']}`\n"
+            text += f"• Progress: Scanned Msg ID `{t['current_msg_id']}` | Files: `{t['total_files']}`\n"
+            text += f"• Mode: `{t['forward_mode']}`\n\n"
 
-        if mode == "reverse_order":
-            files.reverse()
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="show_quests"), InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
-        tasks = []
-        for file_info in files:
-            f_type = file_info["file_type"]
-            f_id = file_info["file_id"]
-            caption = file_info["caption"]
-
-            if f_type == "document":
-                tasks.append(context.bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
-            elif f_type == "video":
-                tasks.append(context.bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption))
-            elif f_type == "photo":
-                tasks.append(context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption))
-            elif f_type == "audio":
-                tasks.append(context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
-
-        chunk_size = 10
-        for i in range(0, len(tasks), chunk_size):
-            chunk = tasks[i:i + chunk_size]
-            await asyncio.gather(*chunk, return_exceptions=True)
-
-        await context.bot.send_message(chat_id=user_id, text="✅ All files dispatched with correct serial positioning. Session records and cases deleted successfully!")
-        user_sessions.clear_session(user_id)
+    elif query.data == "back_to_start":
+        await start(update, context)
+        return
 
 def main():
     if not TOKEN:
@@ -307,7 +370,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
 
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
