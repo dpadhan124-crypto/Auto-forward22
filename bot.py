@@ -46,7 +46,7 @@ def admin_required(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# Local Database-like Storage with 5MB quota simulation constraints
+# Local Database-like Storage simulation constraints
 class LocalBrowserStorage:
     def __init__(self, max_size_bytes=5 * 1024 * 1024):
         self.store = {}
@@ -76,6 +76,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📁 Use Existing Topic ID", callback_data="mode_existing_topic")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send message to chat where command was issued (works in groups or private chats)
     await update.message.reply_text(
         "Welcome Admin! Choose how you would like to route your forwarded files:",
         reply_markup=reply_markup
@@ -90,7 +92,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "awaiting_channel":
         channel_input = update.message.text.strip()
         
-        # Automatically prepend -100 if channel ID is digits only without prefix
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
 
@@ -150,6 +151,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
             user_sessions.set(user_id, user_state)
             try:
+                # Only delete message if sent in private chat or if bot has message deletion rights in group
                 await msg.delete()
             except Exception:
                 pass
@@ -159,15 +161,18 @@ async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE,
     state = user_sessions.get(user_id)
     text, reply_markup = get_panel_content(state)
     
-    sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    target_chat_id = update.effective_chat.id
+    sent_msg = await context.bot.send_message(chat_id=target_chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
     
-    # Pin configuration panel message securely
+    # Pin configuration panel message securely if in private chat (pinning works differently in groups depending on admin rights)
     try:
-        await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id, disable_notification=True)
+        if update.effective_chat.type == "private":
+            await context.bot.pin_chat_message(chat_id=target_chat_id, message_id=sent_msg.message_id, disable_notification=True)
     except Exception as e:
         logger.error(f"Could not pin configuration message: {e}")
         
     state["panel_message_id"] = sent_msg.message_id
+    state["panel_chat_id"] = target_chat_id
     user_sessions.set(user_id, state)
 
 async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -177,14 +182,13 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
     text, reply_markup = get_panel_content(state)
     try:
         await context.bot.edit_message_text(
-            chat_id=user_id,
+            chat_id=state.get("panel_chat_id", user_id),
             message_id=state["panel_message_id"],
             text=text,
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
     except BadRequest as e:
-        # Ignore errors if content has not changed to prevent button freezing
         if "Message is not modified" not in str(e):
             logger.error(f"Failed to update control panel: {e}")
     except Exception as e:
@@ -266,6 +270,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_id = file_info["file_id"]
             caption = file_info["caption"]
 
+        # ... (dispatch logic remains identical)
             if f_type == "document":
                 tasks.append(context.bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
             elif f_type == "video":
@@ -280,7 +285,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunk = tasks[i:i + chunk_size]
             await asyncio.gather(*chunk, return_exceptions=True)
 
-        await context.bot.send_message(chat_id=user_id, text="✅ All files have been high-speed dispatched anonymously!")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ All files have been high-speed dispatched anonymously!")
         user_sessions.pop(user_id, None)
 
 def main():
@@ -289,8 +294,11 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # CommandHandler automatically handles /start, /start@bot_username, etc. out of the box in python-telegram-bot
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Updated filters to capture text/attachments properly in groups when users are interacting with the bot session
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
 
