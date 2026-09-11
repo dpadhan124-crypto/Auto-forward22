@@ -99,6 +99,15 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+    def clear_all_database(self):
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sessions")
+        cursor.execute("DELETE FROM tasks")
+        cursor.execute("DELETE FROM scanned_files")
+        conn.commit()
+        conn.close()
+
     def create_task(self, user_id, channel_input, channel_name, topic_id, forward_mode):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -196,7 +205,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message or (update.callback_query and update.callback_query.message)
     if msg:
         if update.callback_query:
-            await update.callback_query.message.edit_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
+            try:
+                await update.callback_query.message.edit_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
+            except Exception:
+                await update.callback_query.message.reply_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
         else:
             await msg.reply_text("Welcome Admin! Choose an option below:", reply_markup=reply_markup)
 
@@ -211,31 +223,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
 
-        forward_mode = session.get("forward_mode", "regular")
-        db.clear_session(user_id)
-
-        try:
-            chat = await context.bot.get_chat(channel_input)
-            channel_name = chat.title
-            
-            topic = await context.bot.create_forum_topic(
-                chat_id=DESTINATION_GROUP_ID,
-                name=channel_name
-            )
-            
-            task_id = db.create_task(user_id, channel_input, channel_name, topic.message_thread_id, forward_mode)
-            
-            await update.message.reply_text(
-                f"✅ Channel **{channel_name}** verified!\n"
-                f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
-                f"⚡ Automatic file scanning has started in the background. Check **📜 Quest Status** for progress."
-            )
-            
-            # Start background scanning task
-            asyncio.create_task(run_channel_scanner(context.bot, task_id))
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error accessing channel: {e}")
+        # Save channel input temporarily in session and ask for mode & done button confirmation
+        db.set_session(user_id, channel_input=channel_input, step="awaiting_mode_confirmation")
+        
+        keyboard = [
+            [InlineKeyboardButton("Mode: Regular", callback_data="set_mode_regular"),
+             InlineKeyboardButton("Mode: Reverse", callback_data="set_mode_reverse")],
+            [InlineKeyboardButton("✅ Done / Start Scan", callback_data="confirm_scan_start")]
+        ]
+        await update.message.reply_text(
+            f"📢 Channel target received: `{channel_input}`\n\n"
+            f"Current Forward Mode: **Regular**\n"
+            f"Click mode button to toggle, then click **✅ Done / Start Scan** to begin processing.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
 
 async def run_channel_scanner(bot, task_id):
     task = db.get_task(task_id)
@@ -249,82 +251,45 @@ async def run_channel_scanner(bot, task_id):
 
     msg_id = 1
     consecutive_misses = 0
-    max_misses = 25  # Stop after 25 consecutive missing message IDs
+    max_misses = 40  # Increased threshold to avoid stopping too early on sparse or missing gaps
     total_files = 0
 
-    logger.info(f"Starting auto-scan for task {task_id} ({task['channel_name']})")
+    logger.info(f"Starting auto-scan for task {task_id} ({channel_id})")
 
     while consecutive_misses < max_misses:
         try:
-            # Forward message to admin chat temporarily to inspect content safely
-            test_msg = await bot.forward_message(
-                chat_id=user_id,
-                from_chat_id=channel_id,
-                message_id=msg_id
-            )
-
-            file_id = None
-            f_type = "document"
-            caption = test_msg.caption or ""
-
-            if test_msg.document:
-                file_id, f_type = test_msg.document.file_id, "document"
-            elif test_msg.video:
-                file_id, f_type = test_msg.video.file_id, "video"
-            elif test_msg.photo:
-                file_id, f_type = test_msg.photo[-1].file_id, "photo"
-            elif test_msg.audio:
-                file_id, f_type = test_msg.audio.file_id, "audio"
-
-            # Delete the inspection message from admin chat immediately
+            # Force copy/forward message to destination topic or fallback test chat
+            # Since bot is admin in channel, copy_message works reliably for pulling media/content without failing on restricted channels if permissions permit
+            forwarded = None
             try:
-                await test_msg.delete()
+                forwarded = await bot.copy_message(
+                    chat_id=DESTINATION_GROUP_ID,
+                    message_thread_id=topic_id,
+                    from_chat_id=channel_id,
+                    message_id=msg_id
+                )
             except Exception:
                 pass
 
-            if file_id:
+            if forwarded:
                 total_files += 1
-                db.add_scanned_file(task_id, total_files, f_type, file_id, caption)
+                db.add_scanned_file(task_id, total_files, "copied", str(forwarded.message_id), "")
+                consecutive_misses = 0
+            else:
+                consecutive_misses += 1
 
-            consecutive_misses = 0  # Reset on valid message found
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Scan skip msg_id {msg_id}: {e}")
             consecutive_misses += 1
 
         db.update_task_progress(task_id, msg_id, total_files)
         msg_id += 1
-        await asyncio.sleep(0.1)  # Rate limiting safeguard
+        await asyncio.sleep(0.05) # High-speed concurrent throttling
 
-    # Scanning completed, now dispatch files
-    db.update_task_progress(task_id, msg_id - 1, total_files, status="Dispatching")
-    files = db.get_task_files(task_id)
-
-    if forward_mode == "reverse_order":
-        files.reverse()
-
-    tasks = []
-    for f in files:
-        f_type = f["file_type"]
-        f_id = f["file_id"]
-        caption = f["caption"]
-
-        if f_type == "document":
-            tasks.append(bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
-        elif f_type == "video":
-            tasks.append(bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption))
-        elif f_type == "photo":
-            tasks.append(bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption))
-        elif f_type == "audio":
-            tasks.append(bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
-
-    chunk_size = 10
-    for i in range(0, len(tasks), chunk_size):
-        chunk = tasks[i:i + chunk_size]
-        await asyncio.gather(*chunk, return_exceptions=True)
-        await asyncio.sleep(0.5)
-
+    # Finished scanning via direct copy stream or fallback collection
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Completed")
     try:
-        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} for **{task['channel_name']}** completed successfully! All files dispatched.")
+        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} scan completed! Total files/messages processed & forwarded: `{total_files}`.")
     except Exception:
         pass
 
@@ -333,16 +298,74 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    session = db.get_session(user_id) or {}
 
     if query.data == "start_forward":
         db.set_session(user_id, step="awaiting_channel", forward_mode="regular")
         await query.message.reply_text("Please send your source **Channel ID** (e.g., `1234567890`) or username (`@mychannel`).")
         return
 
+    elif query.data == "set_mode_regular":
+        db.set_session(user_id, forward_mode="regular")
+        keyboard = [
+            [InlineKeyboardButton("Mode: Regular ✅", callback_data="set_mode_regular"),
+             InlineKeyboardButton("Mode: Reverse", callback_data="set_mode_reverse")],
+            [InlineKeyboardButton("✅ Done / Start Scan", callback_data="confirm_scan_start")]
+        ]
+        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    elif query.data == "set_mode_reverse":
+        db.set_session(user_id, forward_mode="reverse_order")
+        keyboard = [
+            [InlineKeyboardButton("Mode: Regular", callback_data="set_mode_regular"),
+             InlineKeyboardButton("Mode: Reverse ✅", callback_data="set_mode_reverse")],
+            [InlineKeyboardButton("✅ Done / Start Scan", callback_data="confirm_scan_start")]
+        ]
+        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    elif query.data == "confirm_scan_start":
+        channel_input = session.get("channel_input")
+        forward_mode = session.get("forward_mode", "regular")
+        db.clear_session(user_id)
+
+        if not channel_input:
+            await query.message.edit_text("⚠️ Session expired or channel missing. Please start over with `/start`.")
+            return
+
+        try:
+            chat = await context.bot.get_chat(channel_input)
+            channel_name = chat.title
+            
+            topic = await context.bot.create_forum_topic(
+                chat_id=DESTINATION_GROUP_ID,
+                name=channel_name
+            )
+            
+            task_id = db.create_task(user_id, channel_input, channel_name, topic.message_thread_id, forward_mode)
+            
+            await query.message.edit_text(
+                f"✅ Channel **{channel_name}** verified & locked!\n"
+                f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
+                f"⚡ Forceful background auto-scan initiated from ID 1 upwards. Check **📜 Quest Status** for live progress."
+            )
+            
+            asyncio.create_task(run_channel_scanner(context.bot, task_id))
+
+        except Exception as e:
+            await query.message.edit_text(f"❌ Error initiating channel scan: {e}")
+        return
+
     elif query.data == "show_quests":
         tasks = db.get_all_tasks()
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh", callback_data="show_quests"),
+             InlineKeyboardButton("🗑️ Clear Database", callback_data="clear_database")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
+        ]
         if not tasks:
-            await query.message.edit_text("📜 No active or completed quests found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]))
+            await query.message.edit_text("📜 No active or completed quests found.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
 
         text = "📜 **Quest System Status**\n\n"
@@ -350,11 +373,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_emoji = "🔄" if t["status"] == "Scanning" else ("⚡" if t["status"] == "Dispatching" else "✅")
             text += f"**#{t['task_id']}** | 📢 {t['channel_name']}\n"
             text += f"• Status: {status_emoji} `{t['status']}`\n"
-            text += f"• Progress: Scanned Msg ID `{t['current_msg_id']}` | Files: `{t['total_files']}`\n"
+            text += f"• Scanned Msg ID: `{t['current_msg_id']}` | Files Found: `{t['total_files']}`\n"
             text += f"• Mode: `{t['forward_mode']}`\n\n"
 
-        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="show_quests"), InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]
         await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    elif query.data == "clear_database":
+        db.clear_all_database()
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]
+        await query.message.edit_text("🗑️ Database successfully cleared and all task history wiped!", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif query.data == "back_to_start":
