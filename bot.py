@@ -46,170 +46,106 @@ def admin_required(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-# Local Database-like Storage simulation constraints
-class LocalBrowserStorage:
-    def __init__(self, max_size_bytes=5 * 1024 * 1024):
-        self.store = {}
-        self.max_size = max_size_bytes
+# Storage for active setups and channel-to-topic dynamic mappings
+class ChannelStore:
+    def __init__(self):
+        self.sessions = {}   # user_id -> interactive session steps
+        self.mappings = {}   # channel_id (int) -> {"topic_id": int, "channel_name": str}
 
-    def get(self, user_id):
-        return self.store.get(user_id)
-
-    def set(self, user_id, data):
-        import sys
-        approx_size = sys.getsizeof(str(self.store))
-        if approx_size >= self.max_size:
-            logger.warning("Local storage quota limit approaching!")
-        self.store[user_id] = data
-
-    def pop(self, user_id, default=None):
-        return self.store.pop(user_id, default)
-
-user_sessions = LocalBrowserStorage()
+storage = ChannelStore()
 
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🆕 Create New Topic (From Channel ID)", callback_data="mode_new_topic")],
-        [InlineKeyboardButton("📁 Use Existing Topic ID", callback_data="mode_existing_topic")]
+        [InlineKeyboardButton("🤖 Add Bot to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🆕 Auto-Link Channel & Create Topic", callback_data="mode_auto_channel")],
+        [InlineKeyboardButton("📁 Link to Existing Topic ID", callback_data="mode_existing_topic")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Send message to chat where command was issued (works in groups or private chats)
-    await update.message.reply_text(
-        "Welcome Admin! Choose how you would like to route your forwarded files:",
+    target_chat = update.message or update.callback_query.message
+    await target_chat.reply_text(
+        "Welcome Admin! Choose an option to configure automatic channel forwarding:",
         reply_markup=reply_markup
     )
 
 @admin_required
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_state = user_sessions.get(user_id) or {}
+    user_state = storage.sessions.get(user_id) or {}
     step = user_state.get("step")
 
     if step == "awaiting_channel":
         channel_input = update.message.text.strip()
-        
         if channel_input.isdigit():
             channel_input = f"-100{channel_input}"
 
         try:
             chat = await context.bot.get_chat(channel_input)
+            channel_id = chat.id
             channel_name = chat.title
             
+            # Create a dedicated forum topic automatically using the channel name
             topic = await context.bot.create_forum_topic(
                 chat_id=DESTINATION_GROUP_ID,
                 name=channel_name
             )
+            topic_id = topic.message_thread_id
+
+            # Save permanent mapping for automatic background streaming
+            storage.mappings[channel_id] = {
+                "topic_id": topic_id,
+                "channel_name": channel_name
+            }
             
-            user_sessions.set(user_id, {
-                "step": "collecting_files",
-                "topic_id": topic.message_thread_id,
-                "forward_mode": "regular",
-                "files": []
-            })
-            await send_control_panel(update, context, user_id)
+            storage.sessions.pop(user_id, None)
+            
+            await update.message.reply_text(
+                f"✅ **Channel Automatically Linked!**\n\n"
+                f"• **Source Channel:** `{channel_name}` (`{channel_id}`)\n"
+                f"• **Destination Topic ID:** `{topic_id}`\n\n"
+                f"Any new posts published in this channel will now stream automatically to the destination group topic.",
+                parse_mode="Markdown"
+            )
         except Exception as e:
-            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}\nMake sure the bot is an admin in the channel and destination group.")
+            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}\nMake sure the bot is an admin in both the source channel and destination group.")
 
     elif step == "awaiting_existing_topic":
         topic_input = update.message.text.strip()
         if not topic_input.isdigit():
-            await update.message.reply_text("❌ Topic ID must be a numeric value. Please try again:")
+            await update.message.reply_text("❌ Topic ID must be numeric value. Please try again:")
             return
-
-        topic_id = int(topic_input)
-        user_sessions.set(user_id, {
-            "step": "collecting_files",
-            "topic_id": topic_id,
-            "forward_mode": "regular",
-            "files": []
-        })
-        await send_control_panel(update, context, user_id)
-    
-    elif step == "collecting_files":
-        msg = update.message
-        file_id = None
-        f_type = "document"
-
-        if msg.document:
-            file_id, f_type = msg.document.file_id, "document"
-        elif msg.video:
-            file_id, f_type = msg.video.file_id, "video"
-        elif msg.photo:
-            file_id, f_type = msg.photo[-1].file_id, "photo"
-        elif msg.audio:
-            file_id, f_type = msg.audio.file_id, "audio"
-
-        if file_id:
-            user_state["files"].append({
-                "type": f_type,
-                "file_id": file_id,
-                "caption": msg.caption or ""
-            })
-            user_sessions.set(user_id, user_state)
-            try:
-                # Only delete message if sent in private chat or if bot has message deletion rights in group
-                await msg.delete()
-            except Exception:
-                pass
-            await update_control_panel(update, context, user_id)
-
-async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get(user_id)
-    text, reply_markup = get_panel_content(state)
-    
-    target_chat_id = update.effective_chat.id
-    sent_msg = await context.bot.send_message(chat_id=target_chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
-    
-    # Pin configuration panel message securely if in private chat (pinning works differently in groups depending on admin rights)
-    try:
-        if update.effective_chat.type == "private":
-            await context.bot.pin_chat_message(chat_id=target_chat_id, message_id=sent_msg.message_id, disable_notification=True)
-    except Exception as e:
-        logger.error(f"Could not pin configuration message: {e}")
         
-    state["panel_message_id"] = sent_msg.message_id
-    state["panel_chat_id"] = target_chat_id
-    user_sessions.set(user_id, state)
+        user_state["topic_id"] = int(topic_input)
+        user_state["step"] = "awaiting_channel_for_existing"
+        storage.sessions[user_id] = user_state
+        await update.message.reply_text("Now send the source **Channel ID** or username to bind with this existing topic:")
 
-async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    state = user_sessions.get(user_id)
-    if not state or "panel_message_id" not in state:
-        return
-    text, reply_markup = get_panel_content(state)
-    try:
-        await context.bot.edit_message_text(
-            chat_id=state.get("panel_chat_id", user_id),
-            message_id=state["panel_message_id"],
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-    except BadRequest as e:
-        if "Message is not modified" not in str(e):
-            logger.error(f"Failed to update control panel: {e}")
-    except Exception as e:
-        logger.error(f"Failed to update control panel: {e}")
+    elif step == "awaiting_channel_for_existing":
+        channel_input = update.message.text.strip()
+        if channel_input.isdigit():
+            channel_input = f"-100{channel_input}"
 
-def get_panel_content(state):
-    topic_id = state.get("topic_id")
-    mode = state.get("forward_mode")
-    total_files = len(state.get("files", []))
-    text = (
-        f"⚙️ **Configuration Panel**\n\n"
-        f"• **Group topic ID:** `{topic_id}`\n"
-        f"• **Forward mode:** `{mode}`\n"
-        f"• **Total files saved:** `{total_files}`\n\n"
-        f"*(Send files to add them to the queue)*"
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
-        [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
-    ]
-    return text, InlineKeyboardMarkup(keyboard)
+        try:
+            chat = await context.bot.get_chat(channel_input)
+            channel_id = chat.id
+            channel_name = chat.title
+            topic_id = user_state["topic_id"]
+
+            storage.mappings[channel_id] = {
+                "topic_id": topic_id,
+                "channel_name": channel_name
+            }
+            storage.sessions.pop(user_id, None)
+
+            await update.message.reply_text(
+                f"✅ **Channel Linked to Existing Topic!**\n\n"
+                f"• **Source Channel:** `{channel_name}` (`{channel_id}`)\n"
+                f"• **Topic ID:** `{topic_id}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error binding channel: {e}")
 
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -217,76 +153,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
 
-    if query.data == "mode_new_topic":
-        user_sessions.set(user_id, {"step": "awaiting_channel"})
+    if query.data == "mode_auto_channel":
+        storage.sessions[user_id] = {"step": "awaiting_channel"}
         await query.message.reply_text(
-            "Please send your source **Channel ID** or username (e.g., `1234567890`, `-1001234567890`, or `@mychannel`).\n"
-            "A new forum topic will automatically be created in the destination group using the channel's title."
+            "Please send your source **Channel ID** or username (e.g., `-1001234567890` or `@channelname`).\n"
+            "A matching topic will be created automatically."
         )
+    elif query.data == "mode_existing_topic":
+        storage.sessions[user_id] = {"step": "awaiting_existing_topic"}
+        await query.message.reply_text("Please send the numeric **Topic ID** of the existing destination group topic:")
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Automatically scans incoming channel updates and streams files/posts to the target topic."""
+    msg = update.channel_post
+    if not msg:
         return
 
-    if query.data == "mode_existing_topic":
-        user_sessions.set(user_id, {"step": "awaiting_existing_topic"})
-        await query.message.reply_text("Please send the numeric **Topic ID** of the existing destination group topic where files should be dispatched:")
-        return
+    chat_id = msg.chat.id
+    if chat_id not in storage.mappings:
+        return  # Ignore channels that haven't been linked
 
-    state = user_sessions.get(user_id)
-    if not state:
+    topic_id = storage.mappings[chat_id]["topic_id"]
+
+    file_id = None
+    f_type = "document"
+
+    if msg.document:
+        file_id, f_type = msg.document.file_id, "document"
+    elif msg.video:
+        file_id, f_type = msg.video.file_id, "video"
+    elif msg.photo:
+        file_id, f_type = msg.photo[-1].file_id, "photo"
+    elif msg.audio:
+        file_id, f_type = msg.audio.file_id, "audio"
+    elif msg.text:
         try:
-            await query.edit_message_text("Session expired. Send `/start` to begin again.")
-        except Exception:
-            pass
+            await context.bot.send_message(
+                chat_id=DESTINATION_GROUP_ID,
+                message_thread_id=topic_id,
+                text=msg.text,
+                entities=msg.entities
+            )
+        except Exception as e:
+            logger.error(f"Failed to stream text post: {e}")
         return
 
-    if query.data == "toggle_mode":
-        state["forward_mode"] = "reverse_order" if state["forward_mode"] == "regular" else "regular"
-        user_sessions.set(user_id, state)
-        await update_control_panel(update, context, user_id)
-
-    elif query.data == "finish_process":
-        files = state["files"]
-        topic_id = state["topic_id"]
-        mode = state["forward_mode"]
-
-        if not files:
-            try:
-                await query.edit_message_text("⚠️ No files saved to send.")
-            except Exception:
-                pass
-            user_sessions.pop(user_id, None)
-            return
-
+    if file_id:
+        caption = msg.caption or ""
         try:
-            await query.edit_message_text("⚡ Processing and dispatching files concurrently at high speed...")
-        except Exception:
-            pass
-
-        if mode == "reverse_order":
-            files.reverse()
-
-        tasks = []
-        for file_info in files:
-            f_type = file_info["type"]
-            f_id = file_info["file_id"]
-            caption = file_info["caption"]
-
-        # ... (dispatch logic remains identical)
             if f_type == "document":
-                tasks.append(context.bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption))
+                await context.bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=file_id, caption=caption)
             elif f_type == "video":
-                tasks.append(context.bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption))
+                await context.bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=file_id, caption=caption)
             elif f_type == "photo":
-                tasks.append(context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption))
+                await context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=file_id, caption=caption)
             elif f_type == "audio":
-                tasks.append(context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption))
-
-        chunk_size = 10
-        for i in range(0, len(tasks), chunk_size):
-            chunk = tasks[i:i + chunk_size]
-            await asyncio.gather(*chunk, return_exceptions=True)
-
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ All files have been high-speed dispatched anonymously!")
-        user_sessions.pop(user_id, None)
+                await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=file_id, caption=caption)
+        except Exception as e:
+            logger.error(f"Failed to stream media file from channel post: {e}")
 
 def main():
     if not TOKEN:
@@ -294,13 +218,12 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # CommandHandler automatically handles /start, /start@bot_username, etc. out of the box in python-telegram-bot
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_input))
     
-    # Updated filters to capture text/attachments properly in groups when users are interacting with the bot session
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
+    # Core handler for real-time channel updates (requires bot to be an admin in the channel)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
 
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
