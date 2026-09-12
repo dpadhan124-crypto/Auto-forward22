@@ -3,7 +3,6 @@ import asyncio
 import logging
 import sqlite3
 import random
-from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -184,8 +183,8 @@ def admin_required(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links, forward trigger, and queue view."""
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
         [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")]
     ]
@@ -495,10 +494,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for idx, q in enumerate(current_batch, start=start_idx + 1):
             mode_label = "Rev" if q["forward_mode"] == "reverse_order" else "Reg"
             text += f"{idx}. **{q['channel_title']}** (ID: `{q['max_msg_id']}` | Mode: `{mode_label}`)\n"
-            # Add a dedicated delete/remove button for each serial number item
             keyboard.append([InlineKeyboardButton(f"❌ Remove #{idx} ({q['channel_title'][:15]})", callback_data=f"del_quest_{q['quest_id']}_{page}")])
 
-        # Pagination row
         nav_row = []
         if page > 1:
             nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"view_queue_{page - 1}"))
@@ -518,7 +515,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remove_quest_from_db(quest_id)
         await query.answer("🗑️ Quest removed successfully from queue!", show_alert=True)
 
-        # Refresh the current page view
         quests = get_all_pending_quests()
         if not quests:
             await query.edit_message_text("📋 All pending quests have been cleared from the queue.")
@@ -528,9 +524,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_pages = (len(quests) + per_page - 1) // per_page
         page = min(page, total_pages)
 
-        # Re-trigger view queue for the active page
-        # Create a mock query payload call by routing back or recreating the view
-        # We can directly invoke the view update block logic here:
         start_idx = (page - 1) * per_page
         end_idx = start_idx + per_page
         current_batch = quests[start_idx:end_idx]
@@ -617,20 +610,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="✅ All queued files have been successfully sent!")
         user_sessions.pop(user_id, None)
 
-# Health-check HTTP route for UptimeRobot
-async def health_check(request):
-    return web.Response(text="Bot is alive and running!", status=200)
-
-async def run_web_server():
-    server_app = web.Application()
-    server_app.router.add_get("/", health_check)
-    server_app.router.add_get(f"/{TOKEN}", health_check)
-    runner = web.AppRunner(server_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Custom health-check web server started on port {PORT}")
-
 def main():
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable configured.")
@@ -646,7 +625,6 @@ def main():
     app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
 
     async def post_init(application):
-        await run_web_server()
         global is_global_forwarding_active
         if not is_global_forwarding_active:
             next_q = get_next_quest()
