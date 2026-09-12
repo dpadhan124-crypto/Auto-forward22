@@ -3,6 +3,8 @@ import asyncio
 import logging
 import sqlite3
 import random
+import threading
+from flask import Flask, render_template_string, request, redirect, url_for, session as flask_session
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -22,12 +24,12 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") or33 os.getenv("RENDER_EXTERNAL_URL")
 
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
 
-# SQLite Database Initialization with Queues Support
+# SQLite Database Initialization with Persistent Quest Queue & Settings
 DB_FILE = "forwarder_progress.db"
 
 def init_db():
@@ -58,10 +60,33 @@ def init_db():
             status TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot1_username', 'Dps_Storiesbot')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot2_username', 'fm_Storiesbot')")
     conn.commit()
     conn.close()
 
 init_db()
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
 
 def save_progress_db(data: dict):
     conn = sqlite3.connect(DB_FILE)
@@ -147,11 +172,172 @@ def set_quest_status(quest_id: int, status: str):
     conn.commit()
     conn.close()
 
+def reset_running_quests():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE quest_queue SET status = 'pending' WHERE status = 'running'")
+    conn.commit()
+    conn.close()
+
+reset_running_quests()
+
 user_sessions = {}
 is_global_forwarding_active = False
 
+# Flask Web Dashboard Initialization
+flask_app = Flask(__name__)
+flask_app.secret_key = os.urandom(24)
+
+@flask_app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == "@dps":
+            flask_session["logged_in"] = True
+            return redirect(url_for("dashboard"))
+        else:
+            error = "Invalid password. Try again."
+    
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Login - Bot Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 300px; text-align: center; }
+        input[type="password"] { width: 90%; padding: 10px; margin: 15px 0; border: 1px solid #ddd; border-radius: 4px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; }
+        button:hover { background: #0056b3; }
+        .error { color: red; font-size: 14px; }
+    </style>
+    </head>
+    <body>
+        <div class="login-box">
+            <h2>🔒 Dashboard Login</h2>
+            {% if error %}<p class="error">{{ error }}</p>{% endif %}
+            <form method="POST">
+                <input type="password" name="password" placeholder="Enter password" required autofocus>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+@flask_app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+    if not flask_session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "update_settings":
+            bot1 = request.form.get("bot1_username")
+            bot2 = request.form.get("bot2_username")
+            if bot1:
+                set_setting("bot1_username", bot1.strip().lstrip("@"))
+            if bot2:
+                set_setting("bot2_username", bot2.strip().lstrip("@"))
+        elif action == "delete_quest":
+            qid = request.form.get("quest_id")
+            cursor.execute("DELETE FROM quest_queue WHERE id = ?", (qid,))
+            conn.commit()
+        elif action == "clear_progress":
+            cursor.execute("DELETE FROM progress")
+            conn.commit()
+
+    cursor.execute("SELECT id, user_id, channel_title, max_msg_id, forward_mode, status FROM quest_queue")
+    quests = cursor.fetchall()
+
+    cursor.execute("SELECT user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, status FROM progress")
+    progress_rows = cursor.fetchall()
+
+    cursor.execute("SELECT key, value FROM settings")
+    settings = cursor.fetchall()
+
+    conn.close()
+
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Bot Admin Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 30px; background: #f4f7f6; color: #333; }
+            h2 { color: #007bff; margin-top: 30px; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 5px; overflow: hidden; }
+            th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
+            th { background-color: #007bff; color: white; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+            .btn { background: #dc3545; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+            .btn:hover { background: #c82333; }
+            .btn-primary { background: #28a745; }
+            .btn-primary:hover { background: #218838; }
+            input[type="text"] { padding: 6px; width: 250px; border: 1px solid #ddd; border-radius: 4px; }
+            .card { background: white; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+            .logout { float: right; background: #6c757d; color: white; padding: 8px 15px; text-decoration: none; border-radius: 4px; }
+        </style>
+    </head>
+    <body>
+        <a href="/logout" class="logout">Logout</a>
+        <h1>🤖 Telegram Bot Control & Inspector Dashboard</h1>
+        
+        <div class="card">
+            <h2>⚙️ Bot Settings Manager</h2>
+            <form method="POST">
+                <input type="hidden" name="action" value="update_settings">
+                {% for s in settings %}
+                    <p><b>{{ s[0] }}:</b> <input type="text" name="{{ s[0] }}" value="{{ s[1] }}"></p>
+                {% endfor %}
+                <button type="submit" class="btn btn-primary">Save Settings</button>
+            </form>
+        </div>
+
+        <h2>📋 Quest Queue Table (`quest_queue`)</h2>
+        <table>
+            <tr><th>ID</th><th>User ID</th><th>Channel Title</th><th>Max ID</th><th>Mode</th><th>Status</th><th>Action</th></tr>
+            {% for q in quests %}
+            <tr>
+                <td>{{ q[0] }}</td><td>{{ q[1] }}</td><td>{{ q[2] }}</td><td>{{ q[3] }}</td><td>{{ q[4] }}</td><td><b>{{ q[5] }}</b></td>
+                <td>
+                    <form method="POST" style="margin:0;">
+                        <input type="hidden" name="action" value="delete_quest">
+                        <input type="hidden" name="quest_id" value="{{ q[0] }}">
+                        <button type="submit" class="btn">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        <h2>📊 Progress Table (`progress`)</h2>
+        <form method="POST" style="margin-bottom: 10px;">
+            <input type="hidden" name="action" value="clear_progress">
+            <button type="submit" class="btn">Clear Progress Table</button>
+        </form>
+        <table>
+            <tr><th>User ID</th><th>Channel ID</th><th>Topic ID</th><th>Max ID</th><th>Current ID</th><th>Success</th><th>Status</th></tr>
+            {% for p in progress_rows %}
+            <tr><td>{{ p[0] }}</td><td>{{ p[1] }}</td><td>{{ p[2] }}</td><td>{{ p[3] }}</td><td>{{ p[4] }}</td><td>{{ p[5] }}</td><td>{{ p[6] }}</td></tr>
+            {% endfor %}
+        </table>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, quests=quests, progress_rows=progress_rows, settings=settings)
+
+@flask_app.route("/logout")
+def logout():
+    flask_session.pop("logged_in", None)
+    return redirect(url_for("login"))
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
 def admin_required(func):
-    """Decorator to restrict handler execution strictly to defined admins."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id not in ADMIN_IDS:
@@ -165,21 +351,89 @@ def admin_required(func):
 
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts the sequence by offering setup links and forward trigger."""
+    bot1 = get_setting("bot1_username", "Dps_Storiesbot")
+    bot2 = get_setting("bot2_username", "fm_Storiesbot")
+
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url=f"https://t.me/{bot1}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url=f"https://t.me/{bot2}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
+        [InlineKeyboardButton("📊 Database Inspector", callback_data="view_db")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "Welcome Admin! Choose an option above to add the bots, or click **Forward** to start the process.",
+        "Welcome Admin! Choose an option below to add bots, start forwarding, or inspect database tables.",
         reply_markup=reply_markup
     )
 
+@admin_required
+async def db_inspector_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    output = "📊 **Database Inspector (`forwarder_progress.db`)**\n\n"
+
+    output += "**1. Table: `quest_queue`**\n```text\n"
+    cursor.execute("SELECT id, user_id, channel_title, max_msg_id, forward_mode, status FROM quest_queue")
+    rows = cursor.fetchall()
+    if rows:
+        output += f"{'ID':<4} | {'User ID':<10} | {'Channel':<15} | {'Max ID':<6} | {'Mode':<12} | {'Status':<10}\n"
+        output += "-" * 65 + "\n"
+        for r in rows:
+            output += f"{r[0]:<4} | {r[1]:<10} | {str(r[2])[:15]:<15} | {r[3]:<6} | {r[4]:<12} | {r[5]:<10}\n"
+    else:
+        output += "No records found in quest_queue.\n"
+    output += "```\n\n"
+
+    output += "**2. Table: `progress`**\n```text\n"
+    cursor.execute("SELECT user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, status FROM progress")
+    rows = cursor.fetchall()
+    if rows:
+        output += f"{'User ID':<10} | {'Topic':<6} | {'Current ID':<10} | {'Success':<8} | {'Status':<10}\n"
+        output += "-" * 55 + "\n"
+        for r in rows:
+            output += f"{r[0]:<10} | {r[2]:<6} | {r[4]:<10} | {r[5]:<8} | {r[6]:<10}\n"
+    else:
+        output += "No active progress records found.\n"
+    output += "```\n\n"
+
+    output += "**3. Table: `settings`**\n```text\n"
+    cursor.execute("SELECT key, value FROM settings")
+    rows = cursor.fetchall()
+    if rows:
+        output += f"{'Key':<20} | {'Value':<20}\n"
+        output += "-" * 45 + "\n"
+        for r in rows:
+            output += f"{r[0]:<20} | {r[1]:<20}\n"
+    output += "```\n\n"
+
+    conn.close()
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(output, parse_mode="Markdown")
+        await update.callback_query.answer()
+    else:
+        await update.message.reply_text(output, parse_mode="Markdown")
+
+@admin_required
+async def set_bot_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    cmd = update.message.text.split()[0].lower()
+
+    if not args:
+        await update.message.reply_text("❌ Please provide a username. Example: `/setbot1 MyNewBot`", parse_mode="Markdown")
+        return
+
+    new_username = args[0].strip().lstrip("@")
+    if "1" in cmd:
+        set_setting("bot1_username", new_username)
+        await update.message.reply_text(f"✅ Bot 1 username successfully updated to: `@{new_username}`", parse_mode="Markdown")
+    elif "2" in cmd:
+        set_setting("bot2_username", new_username)
+        await update.message.reply_text(f"✅ Bot 2 username successfully updated to: `@{new_username}`", parse_mode="Markdown")
+
 async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channel_id: int) -> int:
-    """Send a temporary message to the channel and delete it to obtain the exact highest message ID instantly."""
     try:
         sent_msg = await context.bot.send_message(chat_id=channel_id, text="🔍 Probe sync check...")
         msg_id = sent_msg.message_id
@@ -221,7 +475,6 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming channel identification or queued files."""
     user_id = update.effective_user.id
     user_state = user_sessions.get(user_id)
 
@@ -432,7 +685,6 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
                 success_count += 1
                 live_status_data["success"] = success_count
                 
-                # Random delay between files/messages from 0.2 to 10 seconds
                 await asyncio.sleep(random.uniform(0.2, 10.0))
             except RetryAfter as e:
                 flood_seconds = e.retry_after
@@ -445,7 +697,6 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
                 skipped_count += 1
                 live_status_data["skipped"] = skipped_count
                 
-                # Service message delay: 0.1 seconds
                 await asyncio.sleep(0.1)
 
             msg_id += step_val
@@ -469,7 +720,6 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     )
     await status_msg.edit_text(final_report, parse_mode="Markdown")
 
-    # Check for next queued quest with a 15-second delay between quests
     next_q = get_next_quest()
     if next_q:
         await asyncio.sleep(15.0)
@@ -477,12 +727,25 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     else:
         is_global_forwarding_active = False
 
+async def resume_pending_quests_on_startup(app):
+    await asyncio.sleep(3)
+    global is_global_forwarding_active
+    if not is_global_forwarding_active:
+        next_q = get_next_quest()
+        if next_q:
+            logger.info(f"Resuming pending quest #{next_q['quest_id']} for channel {next_q['channel_title']}")
+            asyncio.create_task(execute_forwarding_quest(app.bot_data.get("context_holder"), next_q))
+
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_global_forwarding_active
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
+    if query.data == "view_db":
+        await db_inspector_command(update, context)
+        return
 
     if query.data == "start_forward":
         user_sessions[user_id] = {"step": "awaiting_channel"}
@@ -509,7 +772,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = state.get("forward_mode", "regular")
         channel_title = state.get("channel_title", "Source Channel")
 
-        # Save quest to database queue
         add_quest_to_db(user_id, source_chat_id, channel_title, topic_id, max_msg_id, mode)
 
         if not is_global_forwarding_active:
@@ -550,7 +812,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption)
                 elif f_type == "audio":
                     await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
-                # Random delay between file dispatches from 0.2 to 10 seconds
                 await asyncio.sleep(random.uniform(0.2, 10.0))
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
@@ -570,12 +831,22 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+    # Start Flask Web Dashboard Server in a background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+
     app = ApplicationBuilder().token(TOKEN).build()
+    
+    app.bot_data["context_holder"] = type('Obj', (object,), {'bot': app.bot})()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("db", db_inspector_command))
+    app.add_handler(CommandHandler("setbot1", set_bot_username))
+    app.add_handler(CommandHandler("setbot2", set_bot_username))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
+
+    loop.create_task(resume_pending_quests_on_startup(app))
 
     if WEBHOOK_URL:
         logger.info(f"Starting webhook server on port {PORT}...")
