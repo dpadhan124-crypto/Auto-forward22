@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "4441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -58,7 +58,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles incoming channel data/files based on current state."""
     user_id = update.effective_user.id
-    user_state = user_sessions.get(user_id, {})
+    user_state = user_sessions.get(user_id)
+
+    # If user hasn't clicked forward or started a session, ignore or prompt
+    if not user_state:
+        return
+
     step = user_state.get("step")
 
     if step == "awaiting_channel":
@@ -103,22 +108,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif step == "collecting_files":
         file_id = None
+        attachment_type = None
+
         if update.message.document:
             file_id = update.message.document.file_id
+            attachment_type = "document"
         elif update.message.video:
             file_id = update.message.video.file_id
+            attachment_type = "video"
         elif update.message.photo:
             file_id = update.message.photo[-1].file_id
+            attachment_type = "photo"
         elif update.message.audio:
             file_id = update.message.audio.file_id
+            attachment_type = "audio"
 
         if file_id:
             user_sessions[user_id]["files"].append({
-                "type": update.message.effective_attachment.__class__.__name__.lower(),
+                "type": attachment_type,
                 "file_id": file_id,
                 "caption": update.message.caption or ""
             })
-            await update.message.delete()
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
             await update_control_panel(update, context, user_id)
 
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -158,7 +172,7 @@ def get_panel_content(state):
         f"• **Group topic id:** `{topic_id}`\n"
         f"• **Forward mode:** `{mode_str}`\n"
         f"• **Total files saved:** `{total_files}`\n\n"
-        f"*(Send files to add them to the queue, then choose a mode & click Done)*"
+        f"*(Send files to add them to the queue, choose a mode, then click Done)*"
     )
 
     keyboard = [
@@ -199,8 +213,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = state["forward_mode"]
 
         if not files:
-            await query.edit_message_text("⚠️ No files saved to send.")
-            user_sessions.pop(user_id, None)
+            await query.answer("⚠️ No files saved to send yet! Please send files first.", show_alert=True)
             return
 
         if not mode:
