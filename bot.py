@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1001234567890"))
 PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")  # Fallback to Render's default if set
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
@@ -56,39 +56,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming text (channel IDs) and media files."""
+    """Handles incoming forwarded messages/files or text-based channel inputs."""
     user_id = update.effective_user.id
     user_state = user_sessions.get(user_id, {})
     step = user_state.get("step")
 
     if step == "awaiting_channel":
-        channel_input = update.message.text.strip()
-        
-        # If channel ID is sent as pure digits without -100, prepend -100
-        if channel_input.isdigit():
-            channel_input = f"-100{channel_input}"
+        channel_id = None
+        channel_title = "Source Channel"
 
-        try:
-            chat = await context.bot.get_chat(channel_input)
-            channel_name = chat.title
-            
-            topic = await context.bot.create_forum_topic(
-                chat_id=DESTINATION_GROUP_ID,
-                name=channel_name
-            )
-            
-            user_sessions[user_id] = {
-                "step": "collecting_files",
-                "topic_id": topic.message_thread_id,
-                "forward_mode": "regular",
-                "files": []
-            }
+        # Check if the message is forwarded from a channel
+        if update.message.forward_origin and hasattr(update.message.forward_origin, "chat"):
+            chat = update.message.forward_origin.chat
+            channel_id = chat.id
+            channel_title = chat.title or "Source Channel"
+        elif update.message.text:
+            channel_input = update.message.text.strip()
+            if channel_input.isdigit():
+                channel_input = f"-100{channel_input}"
+            try:
+                chat = await context.bot.get_chat(channel_input)
+                channel_id = chat.id
+                channel_title = chat.title or "Source Channel"
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error accessing channel: {e}\nMake sure to forward any post directly from the channel or supply a valid username/ID where the bot is an admin.")
+                return
 
-            await send_control_panel(update, context, user_id)
+        if channel_id:
+            try:
+                topic = await context.bot.create_forum_topic(
+                    chat_id=DESTINATION_GROUP_ID,
+                    name=channel_title
+                )
+                
+                user_sessions[user_id] = {
+                    "step": "collecting_files",
+                    "topic_id": topic.message_thread_id,
+                    "forward_mode": "regular",
+                    "files": []
+                }
 
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error accessing channel or creating topic: {e}\nMake sure the bot is an admin in the channel and destination group.")
-    
+                await update.message.reply_text(f"✅ Successfully linked channel: **{channel_title}** (`{channel_id}`) and created a destination topic!")
+                await send_control_panel(update, context, user_id)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error creating forum topic: {e}\nEnsure the bot has admin privileges to manage topics in the destination group.")
+
     elif step == "collecting_files":
         file_id = None
         if update.message.document:
@@ -162,7 +174,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "start_forward":
         user_sessions[user_id] = {"step": "awaiting_channel"}
-        await query.message.reply_text("Please send your source **Channel ID** (you can send it without `-100`, e.g., `1234567890`) or username (`@mychannel`).")
+        await query.message.reply_text("Please **forward any message or file** directly from your source channel here, or send its channel ID/username.")
         return
 
     state = user_sessions.get(user_id)
@@ -207,13 +219,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
 
         await context.bot.send_message(chat_id=user_id, text="✅ All files have been successfully sent anonymously to the destination topic!")
-    user_sessions.pop(user_id, None)
+        user_sessions.pop(user_id, None)
 
 def main():
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable configured.")
 
-    # Fix for Python 3.14 event loop creation on MainThread
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -225,7 +236,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.ATTACHMENT, handle_message))
+    app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
 
     if WEBHOOK_URL:
         logger.info(f"Starting webhook server on port {PORT}...")
