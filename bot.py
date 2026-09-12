@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004470555189"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -43,8 +43,8 @@ user_sessions = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links and forward trigger."""
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -68,7 +68,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "awaiting_channel":
         channel_id = None
         channel_title = "Source Channel"
-        max_msg_id = 100  # Default fallback range upper limit
+        max_msg_id = 350  # Increased upper bound buffer above 269 to prevent premature truncation
 
         if update.message.forward_origin:
             origin = update.message.forward_origin
@@ -76,7 +76,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_id = origin.chat.id
                 channel_title = origin.chat.title or "Source Channel"
             if hasattr(origin, "message_id"):
-                max_msg_id = origin.message_id
+                # Ensure the scanned range covers up to the forwarded post ID or beyond
+                max_msg_id = max(origin.message_id, 350)
         elif update.message.text:
             channel_input = update.message.text.strip()
             if channel_input.isdigit():
@@ -101,7 +102,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "topic_id": topic.message_thread_id,
                     "channel_id": channel_id,
                     "max_msg_id": max_msg_id,
-                    "forward_mode": "regular",  # Default to regular
+                    "forward_mode": "regular",
                     "files": []
                 }
 
@@ -226,12 +227,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         skipped_count = 0
         log_lines = []
 
-        # Fix: explicitly construct list depending on mode to guarantee order execution
         if mode == "reverse_order":
             message_sequence = list(range(max_msg_id, 0, -1))
         else:
             message_sequence = list(range(1, max_msg_id + 1))
 
+        consecutive_failures = 0
         for msg_id in message_sequence:
             try:
                 await context.bot.copy_message(
@@ -241,14 +242,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_thread_id=topic_id
                 )
                 success_count += 1
-                await asyncio.sleep(0.4)
+                consecutive_failures = 0  # Reset fail streak on success
+                await asyncio.sleep(0.3)
             except Exception:
                 skipped_count += 1
+                consecutive_failures += 1
                 log_lines.append(f"ID {msg_id} Skipd it's a service id")
+                
+                # Safety break if we encounter 50 missing IDs in a row past the actual end of channel items
+                if consecutive_failures >= 50 and msg_id > 270:
+                    break
 
-        logs_text = "\n".join(log_lines[:20])
-        if len(log_lines) > 20:
-            logs_text += f"\n... and {len(log_lines) - 20} more skipped items."
+        logs_text = "\n".join(log_lines[:25])
+        if len(log_lines) > 25:
+            logs_text += f"\n... and {len(log_lines) - 25} more skipped items."
 
         final_report = (
             f"⏳ Automated forwarding running\n\n"
