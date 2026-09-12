@@ -130,42 +130,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channel_id: int) -> int:
-    """Fetch exact real upper bound message ID from the channel using binary search / probing."""
-    low = 1
-    high = 1
-    # Rapid exponential probing to find an upper bound that fails
-    while True:
-        try:
-            await context.bot.forward_message(
-                chat_id=DESTINATION_GROUP_ID,
-                from_chat_id=channel_id,
-                message_id=high
-            )
-            # If successful, check higher
-            low = high
-            high *= 2
-        except Exception:
-            # We found a high point that doesn't exist. Now binary search between low and high.
-            break
-        # Safety break if high gets unreasonably huge
-        if high > 1000000:
-            break
+    """Send a temporary message to the channel and delete it to obtain the exact highest message ID instantly."""
+    try:
+        sent_msg = await context.bot.send_message(chat_id=channel_id, text="🔍 Probe sync check...")
+        msg_id = sent_msg.message_id
+        await context.bot.delete_message(chat_id=channel_id, message_id=msg_id)
+        return msg_id
+    except Exception as e:
+        logger.error(f"Failed to probe channel via send/delete: {e}")
+        # Fallback to binary/exponential search if send permission is restricted
+        low = 1
+        high = 1
+        while True:
+            try:
+                await context.bot.forward_message(
+                    chat_id=DESTINATION_GROUP_ID,
+                    from_chat_id=channel_id,
+                    message_id=high
+                )
+                low = high
+                high *= 2
+            except Exception:
+                break
+            if high > 1000000:
+                break
 
-    best_id = low
-    l, r = low, high - 1
-    while l <= r:
-        mid = (l + r) // 2
-        try:
-            await context.bot.forward_message(
-                chat_id=DESTINATION_GROUP_ID,
-                from_chat_id=channel_id,
-                message_id=mid
-            )
-            best_id = mid
-            l = mid + 1
-        except Exception:
-            r = mid - 1
-    return best_id
+        best_id = low
+        l, r = low, high - 1
+        while l <= r:
+            mid = (l + r) // 2
+            try:
+                await context.bot.forward_message(
+                    chat_id=DESTINATION_GROUP_ID,
+                    from_chat_id=channel_id,
+                    message_id=mid
+                )
+                best_id = mid
+                l = mid + 1
+            except Exception:
+                r = mid - 1
+        return best_id
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,9 +207,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if channel_id:
-            status_prompt = await update.message.reply_text(f"🔍 Scanning channel **{channel_title}** to fetch exact real message IDs... Please wait.")
+            status_prompt = await update.message.reply_text(f"🔍 Probing channel **{channel_title}** to fetch exact real message count... Please wait.")
             
-            # Fetch exact real highest message ID
+            # Fetch exact real highest message ID via temporary message send & delete probe
             max_msg_id = await get_exact_latest_message_id(context, channel_id)
             if forwarded_msg_id and forwarded_msg_id > max_msg_id:
                 max_msg_id = forwarded_msg_id
