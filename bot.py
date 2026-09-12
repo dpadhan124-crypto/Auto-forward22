@@ -251,44 +251,48 @@ async def run_channel_scanner(bot, task_id):
 
     msg_id = 1
     consecutive_misses = 0
-    max_misses = 150  # Tolerance threshold for missing IDs
+    max_misses = 500  # High threshold to bridge any large deleted message gaps from ID 1
     total_files = 0
 
-    logger.info(f"Starting auto-scan DM forward collection for task {task_id} ({channel_id})")
+    logger.info(f"Starting precise DM forward scan loop for task {task_id} ({channel_id})")
 
     while consecutive_misses < max_misses:
         try:
-            # Forward message to bot DM (admin user_id) for instant scanning & delete immediately
-            forwarded_msg = await bot.forward_message(
+            # 1. Forward file from channel to bot DM
+            dm_msg = await bot.forward_message(
                 chat_id=user_id,
                 from_chat_id=channel_id,
                 message_id=msg_id,
                 disable_notification=True
             )
 
-            if forwarded_msg:
+            if dm_msg:
                 consecutive_misses = 0
                 f_type = "document"
                 file_id = None
-                caption = forwarded_msg.caption or forwarded_msg.text or ""
+                caption = dm_msg.caption or dm_msg.text or ""
 
-                if forwarded_msg.document:
-                    file_id, f_type = forwarded_msg.document.file_id, "document"
-                elif forwarded_msg.video:
-                    file_id, f_type = forwarded_msg.video.file_id, "video"
-                elif forwarded_msg.photo:
-                    file_id, f_type = forwarded_msg.photo[-1].file_id, "photo"
-                elif forwarded_msg.audio:
-                    file_id, f_type = forwarded_msg.audio.file_id, "audio"
-                elif forwarded_msg.text:
+                if dm_msg.document:
+                    file_id, f_type = dm_msg.document.file_id, "document"
+                elif dm_msg.video:
+                    file_id, f_type = dm_msg.video.file_id, "video"
+                elif dm_msg.photo:
+                    file_id, f_type = dm_msg.photo[-1].file_id, "photo"
+                elif dm_msg.audio:
+                    file_id, f_type = dm_msg.audio.file_id, "audio"
+                elif dm_msg.text:
                     file_id, f_type = str(msg_id), "text"
 
-                # Instantly delete from bot DM
+                # 2. Wait 0.1 seconds as requested
+                await asyncio.sleep(0.1)
+
+                # 3. Instantly delete from bot DM
                 try:
-                    await forwarded_msg.delete()
+                    await dm_msg.delete()
                 except Exception:
                     pass
 
+                # 4. Save file ID with serial number into database
                 if file_id:
                     total_files += 1
                     db.add_scanned_file(task_id, total_files, f_type, file_id, caption)
@@ -300,7 +304,7 @@ async def run_channel_scanner(bot, task_id):
 
         db.update_task_progress(task_id, msg_id, total_files)
         msg_id += 1
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0.05)
 
     # Scanning phase finished, now dispatching files into destination topic
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Dispatching")
@@ -334,7 +338,7 @@ async def run_channel_scanner(bot, task_id):
 
     db.update_task_progress(task_id, msg_id - 1, total_files, status="Completed")
     try:
-        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} completely scanned via DM and dispatched! Total items: `{total_files}`.")
+        await bot.send_message(chat_id=user_id, text=f"✅ Task #{task_id} successfully scanned and dispatched! Total files: `{total_files}`.")
     except Exception:
         pass
 
@@ -407,7 +411,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.edit_text(
                     f"✅ Channel **{channel_name}** verified & locked!\n"
                     f"📌 Created Topic ID: `{topic.message_thread_id}`\n"
-                    f"⚡ DM Forward Scan initiated. Check **📜 Quest Status** for live updates.",
+                    f"⚡ DM Forward & 0.1s Scan initiated. Check **📜 Quest Status** for live updates.",
                     parse_mode="Markdown"
                 )
             except TelegramError:
