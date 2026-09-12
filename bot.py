@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -206,11 +207,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
 
         await context.bot.send_message(chat_id=user_id, text="✅ All files have been successfully sent anonymously to the destination topic!")
-        user_sessions.pop(user_id, None)
+    user_sessions.pop(user_id, None)
 
 def main():
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable configured.")
+
+    # Fix for Python 3.14 event loop creation on MainThread
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -225,7 +233,7 @@ def main():
             listen="0.0.0.0",
             port=PORT,
             webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-            url_path=TOKEN  # <-- Crucial fix: binds Tornado to the incoming update route path
+            url_path=TOKEN
         )
     else:
         logger.info("Starting local polling...")
