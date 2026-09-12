@@ -21,14 +21,17 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
+DEFAULT_DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
+DEFAULT_BOT1_USERNAME = os.getenv("BOT1_USERNAME", "Dps_Storiesbot")
+DEFAULT_BOT2_USERNAME = os.getenv("BOT2_USERNAME", "fm_Storiesbot")
+
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
 
-# SQLite Database Initialization with Robust Support for 100+ Quests
+# SQLite Database Initialization with Robust Support for 100+ Quests & Dynamic Configuration
 DB_FILE = "forwarder_progress.db"
 
 def init_db():
@@ -60,10 +63,42 @@ def init_db():
             status TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
+
+def get_setting(key: str, default_val: str) -> str:
+    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+    return row[0] if row else default_val
+
+def set_setting(key: str, value: str):
+    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+
+def get_destination_group_id() -> int:
+    val = get_setting("destination_group_id", str(DEFAULT_DESTINATION_GROUP_ID))
+    try:
+        return int(val)
+    except ValueError:
+        return DEFAULT_DESTINATION_GROUP_ID
+
+def get_bot1_username() -> str:
+    return get_setting("bot1_username", DEFAULT_BOT1_USERNAME)
+
+def get_bot2_username() -> str:
+    return get_setting("bot2_username", DEFAULT_BOT2_USERNAME)
 
 def save_progress_db(data: dict):
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
@@ -183,23 +218,34 @@ def admin_required(func):
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links, forward trigger, and queue view."""
+    b1 = get_bot1_username()
+    b2 = get_bot2_username()
+    
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url=f"https://t.me/{b1}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url=f"https://t.me/{b2}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
-        [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")]
+        [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     pending_count = len(get_all_pending_quests())
 
+    welcome_text = (
+        f"<b>Welcome Admin!</b>\n\n"
+        f"<blockquote>📊 Quests currently in queue: <b>{pending_count}</b></blockquote>\n\n"
+        f"<i>Choose an option below:</i>"
+    )
+
     await update.message.reply_text(
-        f"Welcome Admin! 📊 Quests currently in queue: **{pending_count}**\n\nChoose an option below:",
+        welcome_text,
         reply_markup=reply_markup,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channel_id: int) -> int:
+    dest_group = get_destination_group_id()
     try:
         sent_msg = await context.bot.send_message(chat_id=channel_id, text="🔍 Probe sync check...")
         msg_id = sent_msg.message_id
@@ -210,7 +256,7 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
         low, high = 1, 1
         while True:
             try:
-                await context.bot.forward_message(chat_id=DESTINATION_GROUP_ID, from_chat_id=channel_id, message_id=high)
+                await context.bot.forward_message(chat_id=dest_group, from_chat_id=channel_id, message_id=high)
                 low = high
                 high *= 2
             except Exception:
@@ -223,7 +269,7 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
         while l <= r:
             mid = (l + r) // 2
             try:
-                await context.bot.forward_message(chat_id=DESTINATION_GROUP_ID, from_chat_id=channel_id, message_id=mid)
+                await context.bot.forward_message(chat_id=dest_group, from_chat_id=channel_id, message_id=mid)
                 best_id = mid
                 l = mid + 1
             except Exception:
@@ -238,7 +284,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     step = user_state.get("step")
-    if step == "awaiting_channel":
+    
+    if step == "setting_dest_group":
+        text_val = update.message.text.strip()
+        try:
+            new_id = int(text_val)
+            set_setting("destination_group_id", str(new_id))
+            user_sessions.pop(user_id, None)
+            await update.message.reply_text(f"✅ Target Group ID successfully updated to: <code>{new_id}</code>", parse_mode="HTML")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID format. Please send a valid numeric Group ID.")
+        return
+
+    elif step == "setting_bot1":
+        b_username = update.message.text.strip().lstrip("@")
+        set_setting("bot1_username", b_username)
+        user_sessions.pop(user_id, None)
+        await update.message.reply_text(f"✅ Bot 1 Username successfully updated to: <code>{b_username}</code>", parse_mode="HTML")
+        return
+
+    elif step == "setting_bot2":
+        b_username = update.message.text.strip().lstrip("@")
+        set_setting("bot2_username", b_username)
+        user_sessions.pop(user_id, None)
+        await update.message.reply_text(f"✅ Bot 2 Username successfully updated to: <code>{b_username}</code>", parse_mode="HTML")
+        return
+
+    elif step == "awaiting_channel":
         channel_id = None
         channel_title = "Source Channel"
         forwarded_msg_id = None
@@ -263,15 +335,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if channel_id:
-            status_prompt = await update.message.reply_text(f"🔍 Probing channel **{channel_title}**... Please wait.")
+            status_prompt = await update.message.reply_text(f"🔍 Probing channel <b>{channel_title}</b>... Please wait.", parse_mode="HTML")
             max_msg_id = await get_exact_latest_message_id(context, channel_id)
             if forwarded_msg_id and forwarded_msg_id > max_msg_id:
                 max_msg_id = forwarded_msg_id
 
+            dest_group = get_destination_group_id()
             try:
                 topic_id = None
                 try:
-                    chats_forum = await context.bot.get_forum_topics(chat_id=DESTINATION_GROUP_ID)
+                    chats_forum = await context.bot.get_forum_topics(chat_id=dest_group)
                     for topic in chats_forum:
                         if topic.name.strip().lower() == channel_title.strip().lower():
                             topic_id = topic.message_thread_id
@@ -280,7 +353,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
                 if not topic_id:
-                    new_topic = await context.bot.create_forum_topic(chat_id=DESTINATION_GROUP_ID, name=channel_title)
+                    new_topic = await context.bot.create_forum_topic(chat_id=dest_group, name=channel_title)
                     topic_id = new_topic.message_thread_id
 
                 user_sessions[user_id] = {
@@ -293,7 +366,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "files": []
                 }
 
-                await status_prompt.edit_text(f"✅ Successfully linked channel: **{channel_title}** (`{channel_id}`) with Total IDs: `{max_msg_id}`!")
+                await status_prompt.edit_text(f"✅ Successfully linked channel: <b>{channel_title}</b> (<code>{channel_id}</code>) with Total IDs: <code>{max_msg_id}</code>!", parse_mode="HTML")
                 await send_control_panel(update, context, user_id)
             except Exception as e:
                 await status_prompt.edit_text(f"❌ Error setting up forum topic: {e}")
@@ -326,7 +399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     state = user_sessions[user_id]
     text, reply_markup = get_panel_content(state)
-    sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    sent_msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
     try:
         await context.bot.pin_chat_message(chat_id=user_id, message_id=sent_msg.message_id)
     except Exception:
@@ -337,7 +410,7 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
     state = user_sessions[user_id]
     text, reply_markup = get_panel_content(state)
     try:
-        await context.bot.edit_message_text(chat_id=user_id, message_id=state["panel_message_id"], text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        await context.bot.edit_message_text(chat_id=user_id, message_id=state["panel_message_id"], text=text, reply_markup=reply_markup, parse_mode="HTML")
     except Exception:
         pass
 
@@ -348,11 +421,11 @@ def get_panel_content(state):
     mode_str = "Reverse Order" if mode == "reverse_order" else "Regular"
 
     text = (
-        f"⚙️ **Configuration Panel**\n\n"
-        f"• **Group topic id:** `{topic_id}`\n"
-        f"• **Forward mode:** `{mode_str}`\n"
-        f"• **Total files saved:** `{total_files}`\n\n"
-        f"*(Send files to queue them, choose a mode, then click Automated Forwarding)*"
+        f"⚙️ <b>Configuration Panel</b>\n\n"
+        f"<blockquote>• <b>Group topic id:</b> <code>{topic_id}</code>\n"
+        f"• <b>Forward mode:</b> <code>{mode_str}</code>\n"
+        f"• <b>Total files saved:</b> <code>{total_files}</code></blockquote>\n\n"
+        f"<i>(Send files to queue them, choose a mode, then click Automated Forwarding)</i>"
     )
     keyboard = [
         [InlineKeyboardButton(f"Mode: {mode_str}", callback_data="toggle_mode")],
@@ -371,12 +444,20 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     max_msg_id = quest["max_msg_id"]
     forward_mode = quest["forward_mode"]
     channel_title = quest["channel_title"]
+    dest_group = get_destination_group_id()
 
     set_quest_status(quest_id, "running")
 
     status_msg = await context.bot.send_message(
         chat_id=user_id,
-        text=f"⏳ Quest Started for **{channel_title}**\n\n• **Total ids:** `{max_msg_id}`\n• **Successfully forwarded ides:** `0`\n• **Skipd ides:** `0`\n• **FloodWait timer:** `none`"
+        text=(
+            f"⏳ Quest Started for <b>{channel_title}</b>\n\n"
+            f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+            f"• <b>Successfully forwarded ides:</b> <code>0</code>\n"
+            f"• <b>Skipd ides:</b> <code>0</code>\n"
+            f"• <b>FloodWait timer:</b> <code>none</code></blockquote>"
+        ),
+        parse_mode="HTML"
     )
 
     success_count = 0
@@ -391,14 +472,14 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
             try:
                 progress_range_str = f"{max_msg_id} to {max(live_status_data['current'], 1)}" if forward_mode == "reverse_order" else f"1 to {min(live_status_data['current'], max_msg_id)}"
                 text = (
-                    f"⏳ Automated forwarding running (**{channel_title}**)\n\n"
-                    f"• **Total ids:** `{max_msg_id}`\n"
-                    f"• **Successfully forwarded ides:** `{live_status_data['success']}`\n"
-                    f"• **Skipd ides:** `{live_status_data['skipped']}`\n\n"
+                    f"⏳ Automated forwarding running (<b>{channel_title}</b>)\n\n"
+                    f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+                    f"• <b>Successfully forwarded ides:</b> <code>{live_status_data['success']}</code>\n"
+                    f"• <b>Skipd ides:</b> <code>{live_status_data['skipped']}</code>\n\n"
                     f"Completed id {progress_range_str}\n"
-                    f"FloodWait timer: `{live_status_data['flood']}`"
+                    f"FloodWait timer: <code>{live_status_data['flood']}</code></blockquote>"
                 )
-                await status_msg.edit_text(text, parse_mode="Markdown")
+                await status_msg.edit_text(text, parse_mode="HTML")
             except Exception:
                 pass
             await asyncio.sleep(1.0)
@@ -411,7 +492,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
             live_status_data["current"] = msg_id
             try:
                 await context.bot.copy_message(
-                    chat_id=DESTINATION_GROUP_ID,
+                    chat_id=dest_group,
                     from_chat_id=source_chat_id,
                     message_id=msg_id,
                     message_thread_id=topic_id
@@ -443,14 +524,14 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
 
     final_range_str = f"{max_msg_id} to 1" if forward_mode == "reverse_order" else f"1 to {max_msg_id}"
     final_report = (
-        f"✅ Quest Completed for **{channel_title}**!\n\n"
-        f"• **Total ids:** `{max_msg_id}`\n"
-        f"• **Successfully forwarded ides:** `{success_count}`\n"
-        f"• **Skipd ides:** `{skipped_count}`\n\n"
+        f"✅ Quest Completed for <b>{channel_title}</b>!\n\n"
+        f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+        f"• <b>Successfully forwarded ides:</b> <code>{success_count}</code>\n"
+        f"• <b>Skipd ides:</b> <code>{skipped_count}</code>\n\n"
         f"Completed id {final_range_str}\n"
-        f"FloodWait timer: `none`"
+        f"FloodWait timer: <code>none</code></blockquote>"
     )
-    await status_msg.edit_text(final_report, parse_mode="Markdown")
+    await status_msg.edit_text(final_report, parse_mode="HTML")
 
     next_q = get_next_quest()
     if next_q:
@@ -464,6 +545,69 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_global_forwarding_active
     query = update.callback_query
     data = query.data
+
+    if data == "open_settings":
+        await query.answer()
+        d_group = get_destination_group_id()
+        b1 = get_bot1_username()
+        b2 = get_bot2_username()
+        
+        text = (
+            f"⚙️ <b>Bot Settings Configuration</b>\n\n"
+            f"<blockquote>• <b>Target Group ID:</b> <code>{d_group}</code>\n"
+            f"• <b>Bot 1 Username:</b> <code>{b1}</code>\n"
+            f"• <b>Bot 2 Username:</b> <code>{b2}</code></blockquote>\n\n"
+            f"<i>Select an option below to update permanently:</i>"
+        )
+        keyboard = [
+            [InlineKeyboardButton("✏️ Change Target Group ID", callback_data="set_group_id")],
+            [InlineKeyboardButton("✏️ Change Bot 1 Username", callback_data="set_bot1_name")],
+            [InlineKeyboardButton("✏️ Change Bot 2 Username", callback_data="set_bot2_name")],
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
+
+    if data == "set_group_id":
+        await query.answer()
+        user_id = query.from_user.id
+        user_sessions[user_id] = {"step": "setting_dest_group"}
+        await query.message.reply_text("📥 Send the new numeric **Target Group ID**:")
+        return
+
+    if data == "set_bot1_name":
+        await query.answer()
+        user_id = query.from_user.id
+        user_sessions[user_id] = {"step": "setting_bot1"}
+        await query.message.reply_text("📥 Send the new username for **Bot 1** (without @):")
+        return
+
+    if data == "set_bot2_name":
+        await query.answer()
+        user_id = query.from_user.id
+        user_sessions[user_id] = {"step": "setting_bot2"}
+        await query.message.reply_text("📥 Send the new username for **Bot 2** (without @):")
+        return
+
+    if data == "back_home":
+        await query.answer()
+        b1 = get_bot1_username()
+        b2 = get_bot2_username()
+        keyboard = [
+            [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url=f"https://t.me/{b1}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+            [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url=f"https://t.me/{b2}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+            [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
+            [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
+        ]
+        pending_count = len(get_all_pending_quests())
+        welcome_text = (
+            f"<b>Welcome Admin!</b>\n\n"
+            f"<blockquote>📊 Quests currently in queue: <b>{pending_count}</b></blockquote>\n\n"
+            f"<i>Choose an option below:</i>"
+        )
+        await query.edit_message_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
 
     if data == "start_forward":
         await query.answer()
@@ -489,12 +633,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_idx = start_idx + per_page
         current_batch = quests[start_idx:end_idx]
 
-        text = f"📋 **Pending Quests Queue (Page {page}/{total_pages})**\n\n"
+        text = f"📋 <b>Pending Quests Queue (Page {page}/{total_pages})</b>\n\n"
         keyboard = []
 
         for idx, q in enumerate(current_batch, start=start_idx + 1):
             mode_label = "Rev" if q["forward_mode"] == "reverse_order" else "Reg"
-            text += f"{idx}. **{q['channel_title']}** (ID: `{q['max_msg_id']}` | Mode: `{mode_label}`)\n"
+            text += f"<blockquote>{idx}. <b>{q['channel_title']}</b> (ID: <code>{q['max_msg_id']}</code> | Mode: <code>{mode_label}</code>)</blockquote>\n"
             keyboard.append([InlineKeyboardButton(f"❌ Remove #{idx} ({q['channel_title'][:15]})", callback_data=f"del_quest_{q['quest_id']}_{page}")])
 
         nav_row = []
@@ -504,8 +648,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_queue_{page + 1}"))
         if nav_row:
             keyboard.append(nav_row)
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")])
 
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
         return
 
     if data.startswith("del_quest_"):
@@ -529,12 +675,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_idx = start_idx + per_page
         current_batch = quests[start_idx:end_idx]
 
-        text = f"📋 **Pending Quests Queue (Page {page}/{total_pages})**\n\n"
+        text = f"📋 <b>Pending Quests Queue (Page {page}/{total_pages})</b>\n\n"
         keyboard = []
 
         for idx, q in enumerate(current_batch, start=start_idx + 1):
             mode_label = "Rev" if q["forward_mode"] == "reverse_order" else "Reg"
-            text += f"{idx}. **{q['channel_title']}** (ID: `{q['max_msg_id']}` | Mode: `{mode_label}`)\n"
+            text += f"<blockquote>{idx}. <b>{q['channel_title']}</b> (ID: <code>{q['max_msg_id']}</code> | Mode: <code>{mode_label}</code>)</blockquote>\n"
             keyboard.append([InlineKeyboardButton(f"❌ Remove #{idx} ({q['channel_title'][:15]})", callback_data=f"del_quest_{q['quest_id']}_{page}")])
 
         nav_row = []
@@ -545,7 +691,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav_row:
             keyboard.append(nav_row)
 
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")])
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
         return
 
     user_id = query.from_user.id
@@ -572,9 +720,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             next_q = get_next_quest()
             if next_q:
                 asyncio.create_task(execute_forwarding_quest(context, next_q))
-                await query.edit_message_text(f"🚀 Quest added & started immediately for **{channel_title}**!")
+                await query.edit_message_text(f"🚀 Quest added & started immediately for <b>{channel_title}</b>!", parse_mode="HTML")
         else:
-            await query.edit_message_text(f"📌 Quest successfully added to queue for **{channel_title}**. It will automatically execute once prior quests finish!")
+            await query.edit_message_text(f"📌 Quest successfully added to queue for <b>{channel_title}</b>. It will automatically execute once prior quests finish!", parse_mode="HTML")
 
         user_sessions.pop(user_id, None)
 
@@ -582,6 +730,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = state["files"]
         topic_id = state["topic_id"]
         mode = state.get("forward_mode", "regular")
+        dest_group = get_destination_group_id()
 
         if not files:
             await query.answer("⚠️ No files saved to send yet!", show_alert=True)
@@ -595,13 +744,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 f_type, f_id, caption = file_info["type"], file_info["file_id"], file_info["caption"]
                 if f_type == "document":
-                    await context.bot.send_document(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, document=f_id, caption=caption)
+                    await context.bot.send_document(chat_id=dest_group, message_thread_id=topic_id, document=f_id, caption=caption)
                 elif f_type == "video":
-                    await context.bot.send_video(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, video=f_id, caption=caption)
+                    await context.bot.send_video(chat_id=dest_group, message_thread_id=topic_id, video=f_id, caption=caption)
                 elif f_type == "photo":
-                    await context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption)
+                    await context.bot.send_photo(chat_id=dest_group, message_thread_id=topic_id, photo=f_id, caption=caption)
                 elif f_type == "audio":
-                    await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
+                    await context.bot.send_audio(chat_id=dest_group, message_thread_id=topic_id, audio=f_id, caption=caption)
                 await asyncio.sleep(random.uniform(0.2, 1.0))
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
