@@ -795,10 +795,21 @@ def main():
             # Set webhook with Telegram
             await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
             
+            # Custom Webhook request handler for python-telegram-bot v21+
+            async def webhook_handler(request):
+                try:
+                    data = await request.json()
+                    update = Update.de_json(data, app.bot)
+                    await app.update_queue.put(update)
+                    return web.Response(status=200)
+                except Exception as e:
+                    logger.error(f"Error handling incoming webhook request: {e}")
+                    return web.Response(status=500)
+            
             # Create custom aiohttp web server with root health check and telegram webhook route
             web_app = web.Application()
             web_app.router.add_get("/", root_health_check)
-            web_app.router.add_post(f"/{TOKEN}", app.update_queue.process_update_data)
+            web_app.router.add_post(f"/{TOKEN}", webhook_handler)
             
             runner = web.AppRunner(web_app)
             await runner.setup()
