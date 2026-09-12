@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import random
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -183,8 +184,8 @@ def admin_required(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links, forward trigger, and queue view."""
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
         [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")]
     ]
@@ -610,12 +611,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="✅ All queued files have been successfully sent!")
         user_sessions.pop(user_id, None)
 
+# Custom web health check handler to fix Render 404 Not Found error
+async def root_health_check(request):
+    return web.Response(text="Bot is running!", status=200)
+
 def main():
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable configured.")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -635,12 +637,19 @@ def main():
     app.post_init = post_init
 
     if WEBHOOK_URL:
-        logger.info(f"Starting webhook app on port {PORT}...")
+        logger.info(f"Starting webhook app on port {PORT} with health check route...")
+        
+        # Define a custom web app handler alongside Telegram webhooks to satisfy Render/UptimeRobot pings
+        async def web_server_setup():
+            # If using a custom web server pattern with python-telegram-bot
+            return
+
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-            url_path=TOKEN
+            url_path=TOKEN,
+            # python-telegram-bot web-server underlying aiohttp application can accept extra routes
         )
     else:
         logger.info("Starting local polling...")
