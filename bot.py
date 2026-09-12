@@ -149,9 +149,13 @@ def index():
 @flask_app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     """Endpoint that receives incoming updates from Telegram via Webhook."""
-    if request.json:
-        update = Update.de_json(request.json, telegram_app.bot)
-        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.updater.bot_loop if hasattr(telegram_app, 'updater') else asyncio.get_event_loop())
+    if request.json and telegram_app:
+        try:
+            update = Update.de_json(request.json, telegram_app.bot)
+            loop = telegram_app.updater.bot_loop if hasattr(telegram_app, 'updater') and telegram_app.updater and hasattr(telegram_app.updater, 'bot_loop') else asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), loop)
+        except Exception as e:
+            logger.error(f"Error processing webhook update: {e}")
     return "OK", 200
 
 @flask_app.route("/login", methods=["GET", "POST"])
@@ -456,7 +460,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if update.message.forward_origin:
             origin = update.message.forward_origin
-            if hasattr(origin, "chat"):
+            if hasattr(origin, "chat") and origin.chat:
                 channel_id = origin.chat.id
                 channel_title = origin.chat.title or "Source Channel"
             if hasattr(origin, "message_id"):
@@ -814,9 +818,13 @@ def main():
                 logger.info(f"Resuming pending quest #{next_q['quest_id']} for channel {next_q['channel_title']}")
                 asyncio.create_task(execute_forwarding_quest(telegram_app.bot_data.get("context_holder"), next_q))
 
-    # Run the setup loop in telegram application's event loop
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup_webhook_and_start())
+    # Safely handle the event loop creation for Python 3.10+
+    try:
+        asyncio.run(setup_webhook_and_start())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_webhook_and_start())
 
     # Start Flask Web Server on the main thread to bind immediately to the port expected by Render
     logger.info(f"Starting Flask web server on port {PORT}...")
