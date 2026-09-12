@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004470555189"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -118,8 +118,8 @@ def admin_required(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links and forward trigger."""
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -128,6 +128,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome Admin! Choose an option above to add the bots, or click **Forward** to start the process.",
         reply_markup=reply_markup
     )
+
+async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channel_id: int) -> int:
+    """Fetch exact real upper bound message ID from the channel using binary search / probing."""
+    low = 1
+    high = 1
+    # Rapid exponential probing to find an upper bound that fails
+    while True:
+        try:
+            await context.bot.forward_message(
+                chat_id=DESTINATION_GROUP_ID,
+                from_chat_id=channel_id,
+                message_id=high
+            )
+            # If successful, check higher
+            low = high
+            high *= 2
+        except Exception:
+            # We found a high point that doesn't exist. Now binary search between low and high.
+            break
+        # Safety break if high gets unreasonably huge
+        if high > 1000000:
+            break
+
+    best_id = low
+    l, r = low, high - 1
+    while l <= r:
+        mid = (l + r) // 2
+        try:
+            await context.bot.forward_message(
+                chat_id=DESTINATION_GROUP_ID,
+                from_chat_id=channel_id,
+                message_id=mid
+            )
+            best_id = mid
+            l = mid + 1
+        except Exception:
+            r = mid - 1
+    return best_id
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -143,7 +181,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "awaiting_channel":
         channel_id = None
         channel_title = "Source Channel"
-        max_msg_id = None
+        forwarded_msg_id = None
 
         if update.message.forward_origin:
             origin = update.message.forward_origin
@@ -151,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_id = origin.chat.id
                 channel_title = origin.chat.title or "Source Channel"
             if hasattr(origin, "message_id"):
-                max_msg_id = origin.message_id
+                forwarded_msg_id = origin.message_id
         elif update.message.text:
             channel_input = update.message.text.strip()
             if channel_input.isdigit():
@@ -164,38 +202,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ Error accessing channel: {e}\nForward any post directly from the channel or supply a valid ID/username.")
                 return
 
-        # If no forwarded message ID was captured, probe for the latest message ID dynamically
-        if channel_id and not max_msg_id:
-            test_id = 500
-            while True:
-                try:
-                    await context.bot.forward_message(
-                        chat_id=user_id,
-                        from_chat_id=channel_id,
-                        message_id=test_id
-                    )
-                    max_msg_id = test_id
-                    test_id += 500  # Jump higher to find the upper bound fast
-                except Exception:
-                    if test_id <= 500:
-                        max_msg_id = 1
-                        break
-                    # Binary/linear fine-tuning backwards to find the exact latest message ID
-                    test_id -= 499
-                    for candidate in range(test_id + 498, test_id - 1, -1):
-                        try:
-                            await context.bot.forward_message(
-                                chat_id=user_id,
-                                from_chat_id=channel_id,
-                                message_id=candidate
-                            )
-                            max_msg_id = candidate
-                            break
-                        except Exception:
-                            continue
-                    break
-
         if channel_id:
+            status_prompt = await update.message.reply_text(f"🔍 Scanning channel **{channel_title}** to fetch exact real message IDs... Please wait.")
+            
+            # Fetch exact real highest message ID
+            max_msg_id = await get_exact_latest_message_id(context, channel_id)
+            if forwarded_msg_id and forwarded_msg_id > max_msg_id:
+                max_msg_id = forwarded_msg_id
+
             try:
                 topic_id = None
                 try:
@@ -223,10 +237,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "files": []
                 }
 
-                await update.message.reply_text(f"✅ Successfully linked channel: **{channel_title}** (`{channel_id}`) with Total Estimated IDs: `{max_msg_id}`!")
+                await status_prompt.edit_text(f"✅ Successfully linked channel: **{channel_title}** (`{channel_id}`) with Exact Real Total IDs: `{max_msg_id}`!")
                 await send_control_panel(update, context, user_id)
             except Exception as e:
-                await update.message.reply_text(f"❌ Error setting up forum topic: {e}\nEnsure the bot has admin privileges to manage topics in the destination group.")
+                await status_prompt.edit_text(f"❌ Error setting up forum topic: {e}\nEnsure the bot has admin privileges to manage topics in the destination group.")
 
     elif step == "collecting_files":
         file_id = None
