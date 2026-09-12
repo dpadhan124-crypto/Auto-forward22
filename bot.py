@@ -88,55 +88,6 @@ def set_setting(key: str, value: str):
     conn.commit()
     conn.close()
 
-def save_progress_db(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO progress 
-        (user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data["user_id"],
-        data["channel_id"],
-        data["topic_id"],
-        data["max_msg_id"],
-        data["current_msg_id"],
-        data["success_count"],
-        data["skipped_count"],
-        data["forward_mode"],
-        data["status"]
-    ))
-    conn.commit()
-    conn.close()
-
-def load_progress_db(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status FROM progress WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {
-            "user_id": row[0],
-            "channel_id": row[1],
-            "topic_id": row[2],
-            "max_msg_id": row[3],
-            "current_msg_id": row[4],
-            "success_count": row[5],
-            "skipped_count": row[6],
-            "forward_mode": row[7],
-            "status": row[8],
-            "files": []
-        }
-    return None
-
-def clear_progress_db(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM progress WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
 def add_quest_to_db(user_id: int, channel_id: int, channel_title: str, topic_id: int, max_msg_id: int, forward_mode: str):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -184,13 +135,25 @@ reset_running_quests()
 user_sessions = {}
 is_global_forwarding_active = False
 
-# Flask Web Dashboard Initialization (Handles Render HTTP traffic)
+# Telegram Application Setup (Global Reference)
+telegram_app = None
+
+# Flask Web Dashboard Initialization
 flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
 
 @flask_app.route("/")
 def index():
     return redirect(url_for("dashboard"))
+
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    """Endpoint that receives incoming updates from Telegram via Webhook."""
+    if request.json:
+        update = Update.de_json(request.json, telegram_app.bot)
+        # Process updates asynchronously using telegram application loop
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.updater.bot_loop if hasattr(telegram_app, 'updater') else asyncio.get_event_loop())
+    return "OK", 200
 
 @flask_app.route("/login", methods=["GET", "POST"])
 def login():
@@ -338,8 +301,6 @@ def logout():
     flask_session.pop("logged_in", None)
     return redirect(url_for("login"))
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 def admin_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -419,23 +380,6 @@ async def db_inspector_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.callback_query.answer()
     else:
         await update.message.reply_text(output, parse_mode="Markdown")
-
-@admin_required
-async def set_bot_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    cmd = update.message.text.split()[0].lower()
-
-    if not args:
-        await update.message.reply_text("❌ Please provide a username. Example: `/setbot1 MyNewBot`", parse_mode="Markdown")
-        return
-
-    new_username = args[0].strip().lstrip("@")
-    if "1" in cmd:
-        set_setting("bot1_username", new_username)
-        await update.message.reply_text(f"✅ Bot 1 username successfully updated to: `@{new_username}`", parse_mode="Markdown")
-    elif "2" in cmd:
-        set_setting("bot2_username", new_username)
-        await update.message.reply_text(f"✅ Bot 2 username successfully updated to: `@{new_username}`", parse_mode="Markdown")
 
 async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channel_id: int) -> int:
     try:
@@ -731,15 +675,6 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     else:
         is_global_forwarding_active = False
 
-async def resume_pending_quests_on_startup(app):
-    await asyncio.sleep(3)
-    global is_global_forwarding_active
-    if not is_global_forwarding_active:
-        next_q = get_next_quest()
-        if next_q:
-            logger.info(f"Resuming pending quest #{next_q['quest_id']} for channel {next_q['channel_title']}")
-            asyncio.create_task(execute_forwarding_quest(app.bot_data.get("context_holder"), next_q))
-
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_global_forwarding_active
@@ -826,36 +761,48 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_sessions.pop(user_id, None)
 
 def main():
+    global telegram_app
     if not TOKEN:
         raise ValueError("No BOT_TOKEN environment variable configured.")
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    # Start Flask Web Dashboard Server in a background thread
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Initialize Telegram Application
+    telegram_app = ApplicationBuilder().token(TOKEN).build()
     
-    app.bot_data["context_holder"] = type('Obj', (object,), {'bot': app.bot})()
+    telegram_app.bot_data["context_holder"] = type('Obj', (object,), {'bot': telegram_app.bot})()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("db", db_inspector_command))
-    app.add_handler(CommandHandler("setbot1", set_bot_username))
-    app.add_handler(CommandHandler("setbot2", set_bot_username))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("db", db_inspector_command))
+    telegram_app.add_handler(CommandHandler("setbot1", set_bot_username))
+    telegram_app.add_handler(CommandHandler("setbot2", set_bot_username))
+    telegram_app.add_handler(CallbackQueryHandler(button_callback))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    telegram_app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
 
-    loop.create_task(resume_pending_quests_on_startup(app))
+    async def setup_webhook_and_start():
+        await telegram_app.initialize()
+        await telegram_app.start()
+        
+        # Set Telegram Webhook dynamically if Render URL is available
+        if WEBHOOK_URL:
+            full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{TOKEN}"
+            logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
+            await telegram_app.bot.set_webhook(url=full_webhook_url)
 
-    # Switch from webhook to long-polling mode. 
-    # This prevents Tornado port bind address-already-in-use conflicts on Render while keeping Flask web dashboard fully active.
-    logger.info("Starting local polling alongside Flask dashboard server...")
-    app.run_polling()
+        # Check for pending background quests on launch
+        global is_global_forwarding_active
+        if not is_global_forwarding_active:
+            next_q = get_next_quest()
+            if next_q:
+                logger.info(f"Resuming pending quest #{next_q['quest_id']} for channel {next_q['channel_title']}")
+                asyncio.create_task(execute_forwarding_quest(telegram_app.bot_data.get("context_holder"), next_q))
+
+    # Run the setup loop in telegram application's event loop
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(setup_webhook_and_start())
+
+    # Start Flask Web Server on the main thread to bind immediately to the port expected by Render
+    logger.info(f"Starting Flask web server on port {PORT}...")
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()
