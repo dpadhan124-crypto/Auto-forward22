@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
 DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
-PORT = int(os.environ.get("PORT", "10000"))  # Render default web port is 10000
+PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 # Authorized Admin IDs
@@ -184,7 +184,7 @@ reset_running_quests()
 user_sessions = {}
 is_global_forwarding_active = False
 
-# Flask Web Dashboard Initialization
+# Flask Web Dashboard Initialization (Handles Render HTTP traffic)
 flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
 
@@ -852,17 +852,10 @@ def main():
 
     loop.create_task(resume_pending_quests_on_startup(app))
 
-    if WEBHOOK_URL:
-        logger.info(f"Starting webhook server on port {PORT}...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-            url_path=TOKEN
-        )
-    else:
-        logger.info("Starting local polling...")
-        app.run_polling()
+    # Switch from webhook to long-polling mode. 
+    # This prevents Tornado port bind address-already-in-use conflicts on Render while keeping Flask web dashboard fully active.
+    logger.info("Starting local polling alongside Flask dashboard server...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
