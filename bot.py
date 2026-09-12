@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "4441022456"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -169,7 +169,7 @@ def get_panel_content(state):
     topic_id = state.get("topic_id")
     mode = state.get("forward_mode", "regular")
     total_files = len(state.get("files", []))
-    mode_str = mode.capitalize()
+    mode_str = "Reverse Order" if mode == "reverse_order" else "Regular"
 
     text = (
         f"⚙️ **Configuration Panel**\n\n"
@@ -218,7 +218,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status_msg = await context.bot.send_message(
             chat_id=user_id,
-            text="⏳ Automated forwarding running from message ID 1 onwards... Please wait."
+            text=f"⏳ Automated forwarding running ({'Reverse' if mode == 'reverse_order' else 'Regular'} order) from message ID 1 to {max_msg_id}... Please wait."
         )
 
         total_ids = max_msg_id
@@ -226,12 +226,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         skipped_count = 0
         log_lines = []
 
-        # Determine the sequence order based on the user's explicit selection
-        message_sequence = range(1, max_msg_id + 1)
+        # Fix: explicitly construct list depending on mode to guarantee order execution
         if mode == "reverse_order":
-            message_sequence = range(max_msg_id, 0, -1)
+            message_sequence = list(range(max_msg_id, 0, -1))
+        else:
+            message_sequence = list(range(1, max_msg_id + 1))
 
-        # Enforce strict serial execution (one-by-one sequential loop with strict awaits)
         for msg_id in message_sequence:
             try:
                 await context.bot.copy_message(
@@ -241,7 +241,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_thread_id=topic_id
                 )
                 success_count += 1
-                await asyncio.sleep(0.4)  # Safe delay to preserve proper sequential order on Telegram servers
+                await asyncio.sleep(0.4)
             except Exception:
                 skipped_count += 1
                 log_lines.append(f"ID {msg_id} Skipd it's a service id")
