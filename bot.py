@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import sqlite3
+import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -26,7 +27,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
 
-# SQLite Database Initialization
+# SQLite Database Initialization with Queues Support
 DB_FILE = "forwarder_progress.db"
 
 def init_db():
@@ -41,6 +42,18 @@ def init_db():
             current_msg_id INTEGER,
             success_count INTEGER,
             skipped_count INTEGER,
+            forward_mode TEXT,
+            status TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS quest_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            channel_id INTEGER,
+            channel_title TEXT,
+            topic_id INTEGER,
+            max_msg_id INTEGER,
             forward_mode TEXT,
             status TEXT
         )
@@ -99,7 +112,43 @@ def clear_progress_db(user_id: int):
     conn.commit()
     conn.close()
 
+def add_quest_to_db(user_id: int, channel_id: int, channel_title: str, topic_id: int, max_msg_id: int, forward_mode: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO quest_queue (user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+    """, (user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode))
+    conn.commit()
+    conn.close()
+
+def get_next_quest():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode FROM quest_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "quest_id": row[0],
+            "user_id": row[1],
+            "channel_id": row[2],
+            "channel_title": row[3],
+            "topic_id": row[4],
+            "max_msg_id": row[5],
+            "forward_mode": row[6]
+        }
+    return None
+
+def set_quest_status(quest_id: int, status: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE quest_queue SET status = ? WHERE id = ?", (status, quest_id))
+    conn.commit()
+    conn.close()
+
 user_sessions = {}
+is_global_forwarding_active = False
 
 def admin_required(func):
     """Decorator to restrict handler execution strictly to defined admins."""
@@ -138,7 +187,6 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
         return msg_id
     except Exception as e:
         logger.error(f"Failed to probe channel via send/delete: {e}")
-        # Fallback to binary/exponential search if send permission is restricted
         low = 1
         high = 1
         while True:
@@ -209,7 +257,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if channel_id:
             status_prompt = await update.message.reply_text(f"🔍 Probing channel **{channel_title}** to fetch exact real message count... Please wait.")
             
-            # Fetch exact real highest message ID via temporary message send & delete probe
             max_msg_id = await get_exact_latest_message_id(context, channel_id)
             if forwarded_msg_id and forwarded_msg_id > max_msg_id:
                 max_msg_id = forwarded_msg_id
@@ -238,6 +285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "channel_id": channel_id,
                     "max_msg_id": max_msg_id,
                     "forward_mode": "regular",
+                    "channel_title": channel_title,
                     "files": []
                 }
 
@@ -322,19 +370,121 @@ def get_panel_content(state):
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
+async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: dict):
+    global is_global_forwarding_active
+    is_global_forwarding_active = True
+    quest_id = quest["quest_id"]
+    user_id = quest["user_id"]
+    source_chat_id = quest["channel_id"]
+    topic_id = quest["topic_id"]
+    max_msg_id = quest["max_msg_id"]
+    forward_mode = quest["forward_mode"]
+    channel_title = quest["channel_title"]
+
+    set_quest_status(quest_id, "running")
+
+    status_msg = await context.bot.send_message(
+        chat_id=user_id,
+        text=f"⏳ Quest Started for **{channel_title}**\n\n• **Total ids:** `{max_msg_id}`\n• **Successfully forwarded ides:** `0`\n• **Skipd ides:** `0`\n• **FloodWait timer:** `none`"
+    )
+
+    success_count = 0
+    skipped_count = 0
+    start_id = max_msg_id if forward_mode == "reverse_order" else 1
+    step_val = -1 if forward_mode == "reverse_order" else 1
+
+    live_status_data = {"success": 0, "skipped": 0, "current": start_id, "flood": "none", "running": True}
+
+    async def update_ui_loop():
+        while live_status_data["running"]:
+            try:
+                if forward_mode == "reverse_order":
+                    progress_range_str = f"{max_msg_id} to {max(live_status_data['current'], 1)}"
+                else:
+                    progress_range_str = f"1 to {min(live_status_data['current'], max_msg_id)}"
+
+                text = (
+                    f"⏳ Automated forwarding running (**{channel_title}**)\n\n"
+                    f"• **Total ids:** `{max_msg_id}`\n"
+                    f"• **Successfully forwarded ides:** `{live_status_data['success']}`\n"
+                    f"• **Skipd ides:** `{live_status_data['skipped']}`\n\n"
+                    f"Completed id {progress_range_str}\n"
+                    f"FloodWait timer: `{live_status_data['flood']}`"
+                )
+                await status_msg.edit_text(text, parse_mode="Markdown")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+    ui_task = asyncio.create_task(update_ui_loop())
+
+    try:
+        msg_id = start_id
+        while (msg_id > 0 if forward_mode == "reverse_order" else msg_id <= max_msg_id):
+            live_status_data["current"] = msg_id
+            try:
+                await context.bot.copy_message(
+                    chat_id=DESTINATION_GROUP_ID,
+                    from_chat_id=source_chat_id,
+                    message_id=msg_id,
+                    message_thread_id=topic_id
+                )
+                success_count += 1
+                live_status_data["success"] = success_count
+                
+                # Random delay between files/messages from 0.2 to 10 seconds
+                await asyncio.sleep(random.uniform(0.2, 10.0))
+            except RetryAfter as e:
+                flood_seconds = e.retry_after
+                live_status_data["flood"] = f"{flood_seconds}s"
+                logger.warning(f"FloodWait encountered: Sleeping for {flood_seconds} seconds.")
+                await asyncio.sleep(flood_seconds)
+                live_status_data["flood"] = "none"
+                continue
+            except Exception:
+                skipped_count += 1
+                live_status_data["skipped"] = skipped_count
+                
+                # Service message delay: 0.1 seconds
+                await asyncio.sleep(0.1)
+
+            msg_id += step_val
+    finally:
+        live_status_data["running"] = False
+        try:
+            await ui_task
+        except Exception:
+            pass
+
+    set_quest_status(quest_id, "completed")
+
+    final_range_str = f"{max_msg_id} to 1" if forward_mode == "reverse_order" else f"1 to {max_msg_id}"
+    final_report = (
+        f"✅ Quest Completed for **{channel_title}**!\n\n"
+        f"• **Total ids:** `{max_msg_id}`\n"
+        f"• **Successfully forwarded ides:** `{success_count}`\n"
+        f"• **Skipd ides:** `{skipped_count}`\n\n"
+        f"Completed id {final_range_str}\n"
+        f"FloodWait timer: `none`"
+    )
+    await status_msg.edit_text(final_report, parse_mode="Markdown")
+
+    # Check for next queued quest with a 15-second delay between quests
+    next_q = get_next_quest()
+    if next_q:
+        await asyncio.sleep(15.0)
+        asyncio.create_task(execute_forwarding_quest(context, next_q))
+    else:
+        is_global_forwarding_active = False
+
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_global_forwarding_active
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
 
     if query.data == "start_forward":
-        db_state = load_progress_db(user_id)
-        if db_state and db_state["status"] == "running":
-            user_sessions[user_id] = db_state
-            await query.message.reply_text("🔄 Resumed existing session from database.")
-            return
-
         user_sessions[user_id] = {"step": "awaiting_channel"}
         await query.message.reply_text("Please **forward any message or file** directly from your source channel here, or send its channel ID/username.")
         return
@@ -357,111 +507,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_chat_id = state["channel_id"]
         max_msg_id = state["max_msg_id"]
         mode = state.get("forward_mode", "regular")
+        channel_title = state.get("channel_title", "Source Channel")
 
-        status_msg = await context.bot.send_message(
-            chat_id=user_id,
-            text=f"⏳ Automated forwarding running...\n\n• **Total ids:** `{max_msg_id}`\n• **Successfully forwarded ides:** `0`\n• **Skipd ides:** `0`\n• **FloodWait timer:** `none`"
-        )
+        # Save quest to database queue
+        add_quest_to_db(user_id, source_chat_id, channel_title, topic_id, max_msg_id, mode)
 
-        total_ids = max_msg_id
-        success_count = 0
-        skipped_count = 0
-        start_id = max_msg_id if mode == "reverse_order" else 1
-        step_val = -1 if mode == "reverse_order" else 1
+        if not is_global_forwarding_active:
+            next_q = get_next_quest()
+            if next_q:
+                asyncio.create_task(execute_forwarding_quest(context, next_q))
+                await query.edit_message_text(f"🚀 Quest added & started immediately for **{channel_title}**!")
+        else:
+            await query.edit_message_text(f"📌 Quest successfully added to queue for **{channel_title}**. It will automatically execute once the current active quest completes!")
 
-        db_data = {
-            "user_id": user_id,
-            "channel_id": source_chat_id,
-            "topic_id": topic_id,
-            "max_msg_id": max_msg_id,
-            "current_msg_id": start_id,
-            "success_count": 0,
-            "skipped_count": 0,
-            "forward_mode": mode,
-            "status": "running"
-        }
-        save_progress_db(db_data)
-
-        live_status_data = {"success": 0, "skipped": 0, "current": start_id, "flood": "none", "running": True}
-
-        async def update_ui_loop():
-            while live_status_data["running"]:
-                try:
-                    if mode == "reverse_order":
-                        progress_range_str = f"{max_msg_id} to {max(live_status_data['current'], 1)}"
-                    else:
-                        progress_range_str = f"1 to {min(live_status_data['current'], max_msg_id)}"
-
-                    text = (
-                        f"⏳ Automated forwarding running\n\n"
-                        f"• **Total ids:** `{total_ids}`\n"
-                        f"• **Successfully forwarded ides:** `{live_status_data['success']}`\n"
-                        f"• **Skipd ides:** `{live_status_data['skipped']}`\n\n"
-                        f"Completed id {progress_range_str}\n"
-                        f"FloodWait timer: `{live_status_data['flood']}`"
-                    )
-                    await status_msg.edit_text(text, parse_mode="Markdown")
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
-
-        ui_task = asyncio.create_task(update_ui_loop())
-
-        try:
-            msg_id = start_id
-            while (msg_id > 0 if mode == "reverse_order" else msg_id <= max_msg_id):
-                live_status_data["current"] = msg_id
-                try:
-                    await context.bot.copy_message(
-                        chat_id=DESTINATION_GROUP_ID,
-                        from_chat_id=source_chat_id,
-                        message_id=msg_id,
-                        message_thread_id=topic_id
-                    )
-                    success_count += 1
-                    live_status_data["success"] = success_count
-                    
-                    # Normal files / regular messages delay: 0.2 seconds
-                    await asyncio.sleep(0.2)
-                except RetryAfter as e:
-                    flood_seconds = e.retry_after
-                    live_status_data["flood"] = f"{flood_seconds}s"
-                    logger.warning(f"FloodWait encountered: Sleeping for {flood_seconds} seconds.")
-                    await asyncio.sleep(flood_seconds)
-                    live_status_data["flood"] = "none"
-                    continue
-                except Exception:
-                    skipped_count += 1
-                    live_status_data["skipped"] = skipped_count
-                    
-                    # Service messages delay: 0.1 seconds
-                    await asyncio.sleep(0.1)
-
-                db_data["current_msg_id"] = msg_id
-                db_data["success_count"] = success_count
-                db_data["skipped_count"] = skipped_count
-                save_progress_db(db_data)
-
-                msg_id += step_val
-        finally:
-            live_status_data["running"] = False
-            try:
-                await ui_task
-            except Exception:
-                pass
-
-        clear_progress_db(user_id)
-        
-        final_range_str = f"{max_msg_id} to 1" if mode == "reverse_order" else f"1 to {max_msg_id}"
-        final_report = (
-            f"✅ Automated forwarding completed!\n\n"
-            f"• **Total ids:** `{total_ids}`\n"
-            f"• **Successfully forwarded ides:** `{success_count}`\n"
-            f"• **Skipd ides:** `{skipped_count}`\n\n"
-            f"Completed id {final_range_str}\n"
-            f"FloodWait timer: `none`"
-        )
-        await status_msg.edit_text(final_report, parse_mode="Markdown")
         user_sessions.pop(user_id, None)
 
     elif query.data == "finish_process":
@@ -492,7 +550,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption)
                 elif f_type == "audio":
                     await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
-                await asyncio.sleep(0.2)
+                # Random delay between file dispatches from 0.2 to 10 seconds
+                await asyncio.sleep(random.uniform(0.2, 10.0))
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
             except Exception as e:
