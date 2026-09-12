@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1001234567890"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -56,7 +56,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming forwarded messages/files or text-based channel inputs."""
+    """Handles incoming channel data/files based on current state."""
     user_id = update.effective_user.id
     user_state = user_sessions.get(user_id, {})
     step = user_state.get("step")
@@ -65,7 +65,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channel_id = None
         channel_title = "Source Channel"
 
-        # Check if the message is forwarded from a channel
         if update.message.forward_origin and hasattr(update.message.forward_origin, "chat"):
             chat = update.message.forward_origin.chat
             channel_id = chat.id
@@ -79,7 +78,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_id = chat.id
                 channel_title = chat.title or "Source Channel"
             except Exception as e:
-                await update.message.reply_text(f"❌ Error accessing channel: {e}\nMake sure to forward any post directly from the channel or supply a valid username/ID where the bot is an admin.")
+                await update.message.reply_text(f"❌ Error accessing channel: {e}\nForward any post directly from the channel or supply a valid ID/username where the bot is an admin.")
                 return
 
         if channel_id:
@@ -92,7 +91,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_sessions[user_id] = {
                     "step": "collecting_files",
                     "topic_id": topic.message_thread_id,
-                    "forward_mode": "regular",
+                    "channel_title": channel_title,
+                    "forward_mode": None,
                     "files": []
                 }
 
@@ -151,17 +151,21 @@ def get_panel_content(state):
     topic_id = state.get("topic_id")
     mode = state.get("forward_mode")
     total_files = len(state.get("files", []))
+    mode_str = mode.capitalize() if mode else "Not Selected"
 
     text = (
         f"⚙️ **Configuration Panel**\n\n"
         f"• **Group topic id:** `{topic_id}`\n"
-        f"• **Forward mode:** `{mode}`\n"
-        f"• **Total file saved:** `{total_files}`\n\n"
-        f"*(Send files to add them to the queue)*"
+        f"• **Forward mode:** `{mode_str}`\n"
+        f"• **Total files saved:** `{total_files}`\n\n"
+        f"*(Send files to add them to the queue, then choose a mode & click Done)*"
     )
 
     keyboard = [
-        [InlineKeyboardButton(f"Mode: {mode.capitalize()}", callback_data="toggle_mode")],
+        [
+            InlineKeyboardButton("Regular Order", callback_data="mode_regular"),
+            InlineKeyboardButton("Reverse Order", callback_data="mode_reverse")
+        ],
         [InlineKeyboardButton("✅ Done", callback_data="finish_process")]
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -182,11 +186,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Session expired. Send `/start` to begin again.")
         return
 
-    if query.data == "toggle_mode":
-        if state["forward_mode"] == "regular":
-            state["forward_mode"] = "reverse_order"
-        else:
-            state["forward_mode"] = "regular"
+    if query.data == "mode_regular":
+        state["forward_mode"] = "regular"
+        await update_control_panel(update, context, user_id)
+    elif query.data == "mode_reverse":
+        state["forward_mode"] = "reverse_order"
         await update_control_panel(update, context, user_id)
 
     elif query.data == "finish_process":
@@ -197,6 +201,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not files:
             await query.edit_message_text("⚠️ No files saved to send.")
             user_sessions.pop(user_id, None)
+            return
+
+        if not mode:
+            await query.answer("⚠️ Please select a forwarding mode (Regular or Reverse) first!", show_alert=True)
             return
 
         await query.edit_message_text("⏳ Processing and dispatching files anonymously...")
