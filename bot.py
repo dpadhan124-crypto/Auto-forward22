@@ -151,7 +151,6 @@ def telegram_webhook():
     """Endpoint that receives incoming updates from Telegram via Webhook."""
     if request.json:
         update = Update.de_json(request.json, telegram_app.bot)
-        # Process updates asynchronously using telegram application loop
         asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.updater.bot_loop if hasattr(telegram_app, 'updater') else asyncio.get_event_loop())
     return "OK", 200
 
@@ -331,6 +330,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome Admin! Choose an option below to add bots, start forwarding, or inspect database tables.",
         reply_markup=reply_markup
     )
+
+@admin_required
+async def set_bot_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to update bot usernames via commands."""
+    command = update.message.text.split()[0].lower()
+    args = context.args
+    
+    if not args:
+        await update.message.reply_text(f"❌ Please provide a username. Usage: `{command} @NewUsername`", parse_mode="Markdown")
+        return
+
+    new_username = args[0].strip().lstrip("@")
+    
+    if "setbot1" in command:
+        set_setting("bot1_username", new_username)
+        await update.message.reply_text(f"✅ Bot 1 username updated to: `@{new_username}`", parse_mode="Markdown")
+    elif "setbot2" in command:
+        set_setting("bot2_username", new_username)
+        await update.message.reply_text(f"✅ Bot 2 username updated to: `@{new_username}`", parse_mode="Markdown")
 
 @admin_required
 async def db_inspector_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
