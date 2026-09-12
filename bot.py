@@ -184,8 +184,8 @@ def admin_required(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links, forward trigger, and queue view."""
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")],
         [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")]
     ]
@@ -639,18 +639,30 @@ def main():
     if WEBHOOK_URL:
         logger.info(f"Starting webhook app on port {PORT} with health check route...")
         
-        # Define a custom web app handler alongside Telegram webhooks to satisfy Render/UptimeRobot pings
-        async def web_server_setup():
-            # If using a custom web server pattern with python-telegram-bot
-            return
+        async def main_runner():
+            await app.initialize()
+            await app.start()
+            
+            # Set webhook with Telegram
+            await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+            
+            # Create custom aiohttp web server with root health check and telegram webhook route
+            web_app = web.Application()
+            web_app.router.add_get("/", root_health_check)
+            web_app.router.add_post(f"/{TOKEN}", app.update_queue.process_update_data)
+            
+            runner = web.AppRunner(web_app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", PORT)
+            await site.start()
+            
+            logger.info(f"Web server started on port {PORT}")
+            
+            # Keep running forever
+            while True:
+                await asyncio.sleep(3600)
 
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-            url_path=TOKEN,
-            # python-telegram-bot web-server underlying aiohttp application can accept extra routes
-        )
+        asyncio.run(main_runner())
     else:
         logger.info("Starting local polling...")
         app.run_polling()
