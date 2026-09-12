@@ -44,7 +44,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the sequence by offering setup links and forward trigger."""
     keyboard = [
         [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url="https://t.me/Dps_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/DPS_xbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
+        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url="https://t.me/fm_Storiesbot?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward", callback_data="start_forward")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -215,9 +215,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_chat_id = state["channel_id"]
         max_msg_id = state["max_msg_id"]
 
-        await query.edit_message_text("⏳ Automated forwarding running from message ID 1 onwards... Please wait.")
+        # Send a brand new message instead of editing the control panel
+        status_msg = await context.bot.send_message(
+            chat_id=user_id,
+            text="⏳ Automated forwarding running from message ID 1 onwards... Please wait."
+        )
 
-        # Loop from message ID 1 up to max_msg_id, ignoring errors, service messages, or delays
+        total_ids = max_msg_id
+        success_count = 0
+        skipped_count = 0
+        log_lines = []
+
         for msg_id in range(1, max_msg_id + 1):
             try:
                 await context.bot.copy_message(
@@ -226,12 +234,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=msg_id,
                     message_thread_id=topic_id
                 )
+                success_count += 1
                 await asyncio.sleep(0.3)  # Prevent flooding limit
             except Exception:
-                # Silently ignore missing messages, service messages, or errors
-                continue
+                skipped_count += 1
+                log_lines.append(f"ID {msg_id} Skipd it's a service id")
 
-        await context.bot.send_message(chat_id=user_id, text="✅ Automated forwarding completed successfully!")
+        # Format output matching requested logs
+        logs_text = "\n".join(log_lines[:20]) # Keep output concise if there are many lines
+        if len(log_lines) > 20:
+            logs_text += f"\n... and {len(log_lines) - 20} more skipped items."
+
+        final_report = (
+            f"⏳ Automated forwarding running\n\n"
+            f"• **Total ids:** `{total_ids}`\n"
+            f"• **Successfully forwarded ides:** `{success_count}`\n"
+            f"• **Skipd ides:** `{skipped_count}`\n\n"
+            f"**Logs:**\n{logs_text}"
+        )
+
+        await status_msg.edit_text(final_report, parse_mode="Markdown")
         user_sessions.pop(user_id, None)
 
     elif query.data == "finish_process":
