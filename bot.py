@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "4441022456"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
