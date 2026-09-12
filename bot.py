@@ -23,13 +23,13 @@ logger = logging.getLogger(__name__)
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
 DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
-PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or33 os.getenv("RENDER_EXTERNAL_URL")
+PORT = int(os.environ.get("PORT", "10000"))  # Render default web port is 10000
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
 
-# SQLite Database Initialization with Persistent Quest Queue & Settings
+# SQLite Database Initialization
 DB_FILE = "forwarder_progress.db"
 
 def init_db():
@@ -188,6 +188,10 @@ is_global_forwarding_active = False
 flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
 
+@flask_app.route("/")
+def index():
+    return redirect(url_for("dashboard"))
+
 @flask_app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
@@ -216,7 +220,7 @@ def login():
             <h2>🔒 Dashboard Login</h2>
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
             <form method="POST">
-                <input type="password" name="password" placeholder="Enter password" required autofocus>
+                <input type="password" name="password" placeholder="Enter password (@dps)" required autofocus>
                 <button type="submit">Login</button>
             </form>
         </div>
