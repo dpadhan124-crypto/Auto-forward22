@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
+DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "4441022456"))
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
@@ -101,7 +101,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "topic_id": topic.message_thread_id,
                     "channel_id": channel_id,
                     "max_msg_id": max_msg_id,
-                    "forward_mode": None,
+                    "forward_mode": "regular",  # Default to regular
                     "files": []
                 }
 
@@ -167,9 +167,9 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def get_panel_content(state):
     topic_id = state.get("topic_id")
-    mode = state.get("forward_mode")
+    mode = state.get("forward_mode", "regular")
     total_files = len(state.get("files", []))
-    mode_str = mode.capitalize() if mode else "Not Selected"
+    mode_str = mode.capitalize()
 
     text = (
         f"⚙️ **Configuration Panel**\n\n"
@@ -203,7 +203,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "toggle_mode":
-        current_mode = state.get("forward_mode")
+        current_mode = state.get("forward_mode", "regular")
         if current_mode == "regular":
             state["forward_mode"] = "reverse_order"
         else:
@@ -214,8 +214,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_id = state["topic_id"]
         source_chat_id = state["channel_id"]
         max_msg_id = state["max_msg_id"]
+        mode = state.get("forward_mode", "regular")
 
-        # Send a brand new message instead of editing the control panel
         status_msg = await context.bot.send_message(
             chat_id=user_id,
             text="⏳ Automated forwarding running from message ID 1 onwards... Please wait."
@@ -226,7 +226,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         skipped_count = 0
         log_lines = []
 
-        for msg_id in range(1, max_msg_id + 1):
+        # Determine the sequence order based on the user's explicit selection
+        message_sequence = range(1, max_msg_id + 1)
+        if mode == "reverse_order":
+            message_sequence = range(max_msg_id, 0, -1)
+
+        # Enforce strict serial execution (one-by-one sequential loop with strict awaits)
+        for msg_id in message_sequence:
             try:
                 await context.bot.copy_message(
                     chat_id=DESTINATION_GROUP_ID,
@@ -235,13 +241,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_thread_id=topic_id
                 )
                 success_count += 1
-                await asyncio.sleep(0.3)  # Prevent flooding limit
+                await asyncio.sleep(0.4)  # Safe delay to preserve proper sequential order on Telegram servers
             except Exception:
                 skipped_count += 1
                 log_lines.append(f"ID {msg_id} Skipd it's a service id")
 
-        # Format output matching requested logs
-        logs_text = "\n".join(log_lines[:20]) # Keep output concise if there are many lines
+        logs_text = "\n".join(log_lines[:20])
         if len(log_lines) > 20:
             logs_text += f"\n... and {len(log_lines) - 20} more skipped items."
 
@@ -259,17 +264,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "finish_process":
         files = state["files"]
         topic_id = state["topic_id"]
-        mode = state["forward_mode"]
+        mode = state.get("forward_mode", "regular")
 
         if not files:
             await query.answer("⚠️ No files saved to send yet! Please send files first or use Automated Forwarding.", show_alert=True)
             return
 
-        if not mode:
-            await query.answer("⚠️ Please select a forwarding mode first!", show_alert=True)
-            return
-
-        await query.edit_message_text("⏳ Processing and dispatching queued files anonymously...")
+        await query.edit_message_text("⏳ Processing and dispatching queued files strictly one by one...")
 
         if mode == "reverse_order":
             files.reverse()
@@ -288,7 +289,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_photo(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, photo=f_id, caption=caption)
                 elif f_type == "audio":
                     await context.bot.send_audio(chat_id=DESTINATION_GROUP_ID, message_thread_id=topic_id, audio=f_id, caption=caption)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.4)
             except Exception as e:
                 logger.error(f"Failed to send file: {e}")
 
