@@ -276,6 +276,7 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
         return best_id
 
 def parse_channel_inputs(text: str) -> list:
+    """Parses raw text containing one or multiple channel IDs/usernames (comma or newline separated)."""
     raw_tokens = []
     for line in text.splitlines():
         for part in line.replace(",", " ").split():
@@ -290,6 +291,8 @@ def parse_channel_inputs(text: str) -> list:
         else:
             num_val = int(token)
             if num_val > 0:
+                parsed_ids.append(-100 * 10**10 + num_val if num_val < 10**10 else -1000000000000 - num_val) # Standardize large or small IDs
+                # Actually standard telegram channel ID with -100 prefix:
                 if not token.startswith("-100"):
                     if token.startswith("-"):
                         parsed_ids.append(int(token.replace("-", "-100")))
@@ -366,6 +369,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.1)
             max_msg_id = await get_exact_latest_message_id(context, channel_id)
             
+            # Store temporarily in session for panel configuration
             user_sessions[user_id] = {
                 "step": "collecting_files",
                 "topic_id": None,
@@ -473,7 +477,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
                 topic_id = new_topic.message_thread_id
             except Exception as e:
                 logger.error(f"Failed to create forum topic for {channel_title}: {e}")
-                topic_id = 1
+                topic_id = 1 # Fallback general topic
 
     set_quest_status(quest_id, "running")
     update_quest_progress(quest_id, quest["current_msg_id"], quest["success_count"], quest["skipped_count"], "running", topic_id)
@@ -521,6 +525,8 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     try:
         msg_id = start_id
         while (msg_id > 0 if forward_mode == "reverse_order" else msg_id <= max_msg_id):
+            # Check current status in DB in case of pause/stop
+            current_q_state = get_next_quest() # or direct check
             with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT status FROM quest_queue WHERE id = ?", (quest_id,))
@@ -562,6 +568,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
         except Exception:
             pass
 
+    # Check if finished normally
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
         cur = conn.cursor()
         cur.execute("SELECT status FROM quest_queue WHERE id = ?", (quest_id,))
@@ -582,6 +589,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
         )
         await status_msg.edit_text(final_report, parse_mode="HTML")
 
+    # Start next pending quest if available
     next_q = get_next_quest()
     if next_q:
         await asyncio.sleep(3.0)
@@ -726,6 +734,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "resume":
             set_quest_status(quest_id, "pending")
             await query.answer("▶️ Quest resumed!", show_alert=True)
+            # If nothing currently running, trigger execution
             if not get_active_running_quest():
                 next_q = get_next_quest()
                 if next_q:
@@ -734,6 +743,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remove_quest_from_db(quest_id)
             await query.answer("🗑️ Quest stopped and removed from queue!", show_alert=True)
 
+        # Refresh queue view
         quests = get_all_quests()
         if not quests:
             await query.edit_message_text("📋 All quests have been cleared from the queue.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]))
@@ -818,6 +828,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ No files saved to send yet!", show_alert=True)
             return
 
+        # Create topic for files batch right now
         topic_id = None
         try:
             forum_topics = await context.bot.get_forum_topics(chat_id=dest_group)
@@ -884,15 +895,39 @@ def main():
     app.post_init = post_init
 
     if WEBHOOK_URL:
-        logger.info(f"Starting native PTB webhook application on port {PORT}...")
+        logger.info(f"Starting webhook app on port {PORT} with health check route...")
         
-        # Native python-telegram-bot built-in webhook runner (handles webhook setup, secret token, and aiohttp web server out of the box)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            secret_token=TOKEN[:32], # Optional security token for Telegram webhooks
-            webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
-        )
+        async def main_runner():
+            await app.initialize()
+            await app.start()
+            
+            await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+            
+            async def webhook_handler(request):
+                try:
+                    data = await request.json()
+                    update = Update.de_json(data, app.bot)
+                    await app.update_queue.put(update)
+                    return web.Response(status=200)
+                except Exception as e:
+                    logger.error(f"Error handling incoming webhook request: {e}")
+                    return web.Response(status=500)
+            
+            web_app = web.Application()
+            web_app.router.add_get("/", root_health_check)
+            web_app.router.add_post(f"/{TOKEN}", webhook_handler)
+            
+            runner = web.AppRunner(web_app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", PORT)
+            await site.start()
+            
+            logger.info(f"Web server started on port {PORT}")
+            
+            while True:
+                await asyncio.sleep(3600)
+
+        asyncio.run(main_runner())
     else:
         logger.info("Starting local polling...")
         app.run_polling()
