@@ -316,11 +316,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if step in ["setting_dest_group", "setting_bot1", "setting_bot2"]:
         val = update.message.text.strip().lstrip("@")
-        keys = {"setting_dest_group": "destination_group_id", "setting_bot1": "bot1_username", "setting_bot2": "bot2_username"}
+        keys = {
+            "setting_dest_group": "destination_group_id", 
+            "setting_bot1": "bot1_username", 
+            "setting_bot2": "bot2_username"
+        }
         set_setting(keys[step], val)
         user_sessions.pop(user_id, None)
         await update.message.reply_text(f"✅ <b>Setting Updated Successfully!</b>\n\nNew Value: <code>{val}</code>", parse_mode="HTML")
         await send_main_menu(update.message.reply_text)
+        return
 
     elif step == "awaiting_channel":
         channels = []
@@ -417,7 +422,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data in ["set_group_id", "set_bot1_name", "set_bot2_name"]:
         await query.answer()
-        user_sessions[query.from_user.id] = {"step": data.replace("set_", "setting_").replace("_name", "")}
+        step_map = {
+            "set_group_id": "setting_dest_group",
+            "set_bot1_name": "setting_bot1",
+            "set_bot2_name": "setting_bot2"
+        }
+        user_sessions[query.from_user.id] = {"step": step_map[data]}
         await query.message.reply_text(
             "📥 <b>Send the new value for this setting:</b>\n\n"
             "<i>Tip: You can copy and paste the ID or username directly into the chat.</i>",
