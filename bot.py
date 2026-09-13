@@ -31,7 +31,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 # Authorized Admin IDs
 ADMIN_IDS = [8323137024, 8553702880]
 
-# SQLite Database Initialization with Robust Support for 100+ Quests & Dynamic Configuration
+# SQLite Database Initialization
 DB_FILE = "forwarder_progress.db"
 
 def init_db():
@@ -59,6 +59,9 @@ def init_db():
             channel_title TEXT,
             topic_id INTEGER,
             max_msg_id INTEGER,
+            current_msg_id INTEGER,
+            success_count INTEGER,
+            skipped_count INTEGER,
             forward_mode TEXT,
             status TEXT
         )
@@ -100,65 +103,20 @@ def get_bot1_username() -> str:
 def get_bot2_username() -> str:
     return get_setting("bot2_username", DEFAULT_BOT2_USERNAME)
 
-def save_progress_db(data: dict):
+def add_quest_to_db(user_id: int, channel_id: int, channel_title: str, max_msg_id: int, forward_mode: str):
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
         cursor = conn.cursor()
+        start_msg = max_msg_id if forward_mode == "reverse_order" else 1
         cursor.execute("""
-            INSERT OR REPLACE INTO progress 
-            (user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data["user_id"],
-            data["channel_id"],
-            data["topic_id"],
-            data["max_msg_id"],
-            data["current_msg_id"],
-            data["success_count"],
-            data["skipped_count"],
-            data["forward_mode"],
-            data["status"]
-        ))
-        conn.commit()
-
-def load_progress_db(user_id: int):
-    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, channel_id, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status FROM progress WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-    if row:
-        return {
-            "user_id": row[0],
-            "channel_id": row[1],
-            "topic_id": row[2],
-            "max_msg_id": row[3],
-            "current_msg_id": row[4],
-            "success_count": row[5],
-            "skipped_count": row[6],
-            "forward_mode": row[7],
-            "status": row[8],
-            "files": []
-        }
-    return None
-
-def clear_progress_db(user_id: int):
-    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM progress WHERE user_id = ?", (user_id,))
-        conn.commit()
-
-def add_quest_to_db(user_id: int, channel_id: int, channel_title: str, topic_id: int, max_msg_id: int, forward_mode: str):
-    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO quest_queue (user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
-        """, (user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode))
+            INSERT INTO quest_queue (user_id, channel_id, channel_title, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status)
+            VALUES (?, ?, ?, NULL, ?, ?, 0, 0, ?, 'pending')
+        """, (user_id, channel_id, channel_title, max_msg_id, start_msg, forward_mode))
         conn.commit()
 
 def get_next_quest():
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, user_id, channel_id, channel_title, topic_id, max_msg_id, forward_mode FROM quest_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1")
+        cursor.execute("SELECT id, user_id, channel_id, channel_title, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status FROM quest_queue WHERE status IN ('pending', 'paused') ORDER BY id ASC LIMIT 1")
         row = cursor.fetchone()
     if row:
         return {
@@ -168,9 +126,51 @@ def get_next_quest():
             "channel_title": row[3],
             "topic_id": row[4],
             "max_msg_id": row[5],
-            "forward_mode": row[6]
+            "current_msg_id": row[6],
+            "success_count": row[7],
+            "skipped_count": row[8],
+            "forward_mode": row[9],
+            "status": row[10]
         }
     return None
+
+def get_active_running_quest():
+    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, user_id, channel_id, channel_title, topic_id, max_msg_id, current_msg_id, success_count, skipped_count, forward_mode, status FROM quest_queue WHERE status = 'running' LIMIT 1")
+        row = cursor.fetchone()
+    if row:
+        return {
+            "quest_id": row[0],
+            "user_id": row[1],
+            "channel_id": row[2],
+            "channel_title": row[3],
+            "topic_id": row[4],
+            "max_msg_id": row[5],
+            "current_msg_id": row[6],
+            "success_count": row[7],
+            "skipped_count": row[8],
+            "forward_mode": row[9],
+            "status": row[10]
+        }
+    return None
+
+def update_quest_progress(quest_id: int, current_msg_id: int, success_count: int, skipped_count: int, status: str, topic_id: int = None):
+    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        if topic_id is not None:
+            cursor.execute("""
+                UPDATE quest_queue 
+                SET current_msg_id = ?, success_count = ?, skipped_count = ?, status = ?, topic_id = ? 
+                WHERE id = ?
+            """, (current_msg_id, success_count, skipped_count, status, topic_id, quest_id))
+        else:
+            cursor.execute("""
+                UPDATE quest_queue 
+                SET current_msg_id = ?, success_count = ?, skipped_count = ?, status = ? 
+                WHERE id = ?
+            """, (current_msg_id, success_count, skipped_count, status, quest_id))
+        conn.commit()
 
 def set_quest_status(quest_id: int, status: str):
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
@@ -184,10 +184,10 @@ def remove_quest_from_db(quest_id: int):
         cursor.execute("DELETE FROM quest_queue WHERE id = ?", (quest_id,))
         conn.commit()
 
-def get_all_pending_quests():
+def get_all_quests():
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, channel_title, max_msg_id, forward_mode FROM quest_queue WHERE status = 'pending' ORDER BY id ASC")
+        cursor.execute("SELECT id, channel_title, max_msg_id, forward_mode, status FROM quest_queue ORDER BY id ASC")
         rows = cursor.fetchall()
     quests = []
     for row in rows:
@@ -195,15 +195,15 @@ def get_all_pending_quests():
             "quest_id": row[0],
             "channel_title": row[1],
             "max_msg_id": row[2],
-            "forward_mode": row[3]
+            "forward_mode": row[3],
+            "status": row[4]
         })
     return quests
 
 user_sessions = {}
-is_global_forwarding_active = False
+active_quest_task = None
 
 def admin_required(func):
-    """Decorator to restrict handler execution strictly to defined admins."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id not in ADMIN_IDS:
@@ -217,7 +217,6 @@ def admin_required(func):
 
 @admin_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Starts the sequence by offering setup links, forward trigger, and queue view."""
     b1 = get_bot1_username()
     b2 = get_bot2_username()
     
@@ -230,7 +229,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    pending_count = len(get_all_pending_quests())
+    pending_count = len([q for q in get_all_quests() if q["status"] in ('pending', 'paused', 'running')])
 
     welcome_text = (
         f"<b>Welcome Admin!</b>\n\n"
@@ -276,6 +275,35 @@ async def get_exact_latest_message_id(context: ContextTypes.DEFAULT_TYPE, channe
                 r = mid - 1
         return best_id
 
+def parse_channel_inputs(text: str) -> list:
+    """Parses raw text containing one or multiple channel IDs/usernames (comma or newline separated)."""
+    raw_tokens = []
+    for line in text.splitlines():
+        for part in line.replace(",", " ").split():
+            clean_part = part.strip()
+            if clean_part:
+                raw_tokens.append(clean_part)
+    
+    parsed_ids = []
+    for token in raw_tokens:
+        if token.startswith("@") or not token.lstrip("-").isdigit():
+            parsed_ids.append(token)
+        else:
+            num_val = int(token)
+            if num_val > 0:
+                parsed_ids.append(-100 * 10**10 + num_val if num_val < 10**10 else -1000000000000 - num_val) # Standardize large or small IDs
+                # Actually standard telegram channel ID with -100 prefix:
+                if not token.startswith("-100"):
+                    if token.startswith("-"):
+                        parsed_ids.append(int(token.replace("-", "-100")))
+                    else:
+                        parsed_ids.append(int(f"-100{token}"))
+                else:
+                    parsed_ids.append(num_val)
+            else:
+                parsed_ids.append(num_val)
+    return parsed_ids
+
 @admin_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -311,65 +339,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif step == "awaiting_channel":
-        channel_id = None
-        channel_title = "Source Channel"
-        forwarded_msg_id = None
+        channels_to_process = []
 
         if update.message.forward_origin:
             origin = update.message.forward_origin
             if hasattr(origin, "chat"):
-                channel_id = origin.chat.id
-                channel_title = origin.chat.title or "Source Channel"
-            if hasattr(origin, "message_id"):
-                forwarded_msg_id = origin.message_id
+                channels_to_process.append((origin.chat.id, origin.chat.title or "Source Channel"))
         elif update.message.text:
-            channel_input = update.message.text.strip()
-            if channel_input.isdigit():
-                channel_input = f"-100{channel_input}"
+            identifiers = parse_channel_inputs(update.message.text)
+            for ident in identifiers:
+                channels_to_process.append((ident, None))
+
+        if not channels_to_process:
+            await update.message.reply_text("❌ No valid channels recognized. Please forward a post or send valid ID(s).")
+            return
+
+        status_prompt = await update.message.reply_text(f"🔍 Probing <b>{len(channels_to_process)}</b> channel(s)... Please wait.", parse_mode="HTML")
+        
+        linked_summary_lines = []
+        for idx, (ch_ident, ch_title_preset) in enumerate(channels_to_process, 1):
             try:
-                chat = await context.bot.get_chat(channel_input)
+                chat = await context.bot.get_chat(ch_ident)
                 channel_id = chat.id
-                channel_title = chat.title or "Source Channel"
+                channel_title = chat.title or ch_title_preset or "Source Channel"
             except Exception as e:
-                await update.message.reply_text(f"❌ Error accessing channel: {e}\nForward any post or provide a valid ID.")
-                return
+                logger.error(f"Error accessing channel {ch_ident}: {e}")
+                continue
 
-        if channel_id:
-            status_prompt = await update.message.reply_text(f"🔍 Probing channel <b>{channel_title}</b>... Please wait.", parse_mode="HTML")
+            await asyncio.sleep(0.1)
             max_msg_id = await get_exact_latest_message_id(context, channel_id)
-            if forwarded_msg_id and forwarded_msg_id > max_msg_id:
-                max_msg_id = forwarded_msg_id
+            
+            # Store temporarily in session for panel configuration
+            user_sessions[user_id] = {
+                "step": "collecting_files",
+                "topic_id": None,
+                "channel_id": channel_id,
+                "max_msg_id": max_msg_id,
+                "forward_mode": "regular",
+                "channel_title": channel_title,
+                "files": []
+            }
+            linked_summary_lines.append(f"{idx}. {channel_title} (<code>{channel_id}</code>) with Total IDs: <b>{max_msg_id}</b>!")
 
-            dest_group = get_destination_group_id()
-            try:
-                topic_id = None
-                try:
-                    chats_forum = await context.bot.get_forum_topics(chat_id=dest_group)
-                    for topic in chats_forum:
-                        if topic.name.strip().lower() == channel_title.strip().lower():
-                            topic_id = topic.message_thread_id
-                            break
-                except Exception:
-                    pass
-
-                if not topic_id:
-                    new_topic = await context.bot.create_forum_topic(chat_id=dest_group, name=channel_title)
-                    topic_id = new_topic.message_thread_id
-
-                user_sessions[user_id] = {
-                    "step": "collecting_files",
-                    "topic_id": topic_id,
-                    "channel_id": channel_id,
-                    "max_msg_id": max_msg_id,
-                    "forward_mode": "regular",
-                    "channel_title": channel_title,
-                    "files": []
-                }
-
-                await status_prompt.edit_text(f"✅ Successfully linked channel: <b>{channel_title}</b> (<code>{channel_id}</code>) with Total IDs: <code>{max_msg_id}</code>!", parse_mode="HTML")
-                await send_control_panel(update, context, user_id)
-            except Exception as e:
-                await status_prompt.edit_text(f"❌ Error setting up forum topic: {e}")
+        if linked_summary_lines:
+            summary_text = "✅ Successfully linked channel(s):\n\n" + "\n".join(linked_summary_lines)
+            await status_prompt.edit_text(summary_text, parse_mode="HTML")
+            await send_control_panel(update, context, user_id)
+        else:
+            await status_prompt.edit_text("❌ Failed to resolve or access any of the provided channels.")
 
     elif step == "collecting_files":
         file_id = None
@@ -415,14 +432,13 @@ async def update_control_panel(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
 
 def get_panel_content(state):
-    topic_id = state.get("topic_id")
     mode = state.get("forward_mode", "regular")
     total_files = len(state.get("files", []))
     mode_str = "Reverse Order" if mode == "reverse_order" else "Regular"
 
     text = (
         f"⚙️ <b>Configuration Panel</b>\n\n"
-        f"<blockquote>• <b>Group topic id:</b> <code>{topic_id}</code>\n"
+        f"<blockquote>• <b>Group topic id:</b> <code>non</code> (set it automatically)\n"
         f"• <b>Forward mode:</b> <code>{mode_str}</code>\n"
         f"• <b>Total files saved:</b> <code>{total_files}</code></blockquote>\n\n"
         f"<i>(Send files to queue them, choose a mode, then click Automated Forwarding)</i>"
@@ -435,37 +451,56 @@ def get_panel_content(state):
     return text, InlineKeyboardMarkup(keyboard)
 
 async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: dict):
-    global is_global_forwarding_active
-    is_global_forwarding_active = True
+    global active_quest_task
     quest_id = quest["quest_id"]
     user_id = quest["user_id"]
     source_chat_id = quest["channel_id"]
-    topic_id = quest["topic_id"]
     max_msg_id = quest["max_msg_id"]
     forward_mode = quest["forward_mode"]
     channel_title = quest["channel_title"]
     dest_group = get_destination_group_id()
 
+    topic_id = quest.get("topic_id")
+    if not topic_id:
+        try:
+            forum_topics = await context.bot.get_forum_topics(chat_id=dest_group)
+            for topic in forum_topics:
+                if topic.name.strip().lower() == channel_title.strip().lower():
+                    topic_id = topic.message_thread_id
+                    break
+        except Exception:
+            pass
+
+        if not topic_id:
+            try:
+                new_topic = await context.bot.create_forum_topic(chat_id=dest_group, name=channel_title)
+                topic_id = new_topic.message_thread_id
+            except Exception as e:
+                logger.error(f"Failed to create forum topic for {channel_title}: {e}")
+                topic_id = 1 # Fallback general topic
+
     set_quest_status(quest_id, "running")
+    update_quest_progress(quest_id, quest["current_msg_id"], quest["success_count"], quest["skipped_count"], "running", topic_id)
 
     status_msg = await context.bot.send_message(
         chat_id=user_id,
         text=(
-            f"⏳ Quest Started for <b>{channel_title}</b>\n\n"
-            f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
-            f"• <b>Successfully forwarded ides:</b> <code>0</code>\n"
-            f"• <b>Skipd ides:</b> <code>0</code>\n"
+            f"⏳ Quest Running for <b>{channel_title}</b>\n\n"
+            f"<blockquote>• <b>Topic ID:</b> <code>{topic_id}</code>\n"
+            f"• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+            f"• <b>Successfully forwarded ides:</b> <code>{quest['success_count']}</code>\n"
+            f"• <b>Skipd ides:</b> <code>{quest['skipped_count']}</code>\n"
             f"• <b>FloodWait timer:</b> <code>none</code></blockquote>"
         ),
         parse_mode="HTML"
     )
 
-    success_count = 0
-    skipped_count = 0
-    start_id = max_msg_id if forward_mode == "reverse_order" else 1
+    success_count = quest["success_count"]
+    skipped_count = quest["skipped_count"]
+    start_id = quest["current_msg_id"]
     step_val = -1 if forward_mode == "reverse_order" else 1
 
-    live_status_data = {"success": 0, "skipped": 0, "current": start_id, "flood": "none", "running": True}
+    live_status_data = {"success": success_count, "skipped": skipped_count, "current": start_id, "flood": "none", "running": True}
 
     async def update_ui_loop():
         while live_status_data["running"]:
@@ -473,7 +508,8 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
                 progress_range_str = f"{max_msg_id} to {max(live_status_data['current'], 1)}" if forward_mode == "reverse_order" else f"1 to {min(live_status_data['current'], max_msg_id)}"
                 text = (
                     f"⏳ Automated forwarding running (<b>{channel_title}</b>)\n\n"
-                    f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+                    f"<blockquote>• <b>Topic ID:</b> <code>{topic_id}</code>\n"
+                    f"• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
                     f"• <b>Successfully forwarded ides:</b> <code>{live_status_data['success']}</code>\n"
                     f"• <b>Skipd ides:</b> <code>{live_status_data['skipped']}</code>\n\n"
                     f"Completed id {progress_range_str}\n"
@@ -489,6 +525,16 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     try:
         msg_id = start_id
         while (msg_id > 0 if forward_mode == "reverse_order" else msg_id <= max_msg_id):
+            # Check current status in DB in case of pause/stop
+            current_q_state = get_next_quest() # or direct check
+            with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT status FROM quest_queue WHERE id = ?", (quest_id,))
+                r = cur.fetchone()
+                if r and r[0] != "running":
+                    live_status_data["running"] = False
+                    break
+
             live_status_data["current"] = msg_id
             try:
                 await context.bot.copy_message(
@@ -499,6 +545,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
                 )
                 success_count += 1
                 live_status_data["success"] = success_count
+                update_quest_progress(quest_id, msg_id + step_val, success_count, skipped_count, "running", topic_id)
                 await asyncio.sleep(random.uniform(0.2, 1.0))
             except RetryAfter as e:
                 flood_seconds = e.retry_after
@@ -510,6 +557,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
             except Exception:
                 skipped_count += 1
                 live_status_data["skipped"] = skipped_count
+                update_quest_progress(quest_id, msg_id + step_val, success_count, skipped_count, "running", topic_id)
                 await asyncio.sleep(0.1)
 
             msg_id += step_val
@@ -520,29 +568,38 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
         except Exception:
             pass
 
-    set_quest_status(quest_id, "completed")
+    # Check if finished normally
+    with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM quest_queue WHERE id = ?", (quest_id,))
+        row = cur.fetchone()
+        current_status = row[0] if row else "completed"
 
-    final_range_str = f"{max_msg_id} to 1" if forward_mode == "reverse_order" else f"1 to {max_msg_id}"
-    final_report = (
-        f"✅ Quest Completed for <b>{channel_title}</b>!\n\n"
-        f"<blockquote>• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
-        f"• <b>Successfully forwarded ides:</b> <code>{success_count}</code>\n"
-        f"• <b>Skipd ides:</b> <code>{skipped_count}</code>\n\n"
-        f"Completed id {final_range_str}\n"
-        f"FloodWait timer: <code>none</code></blockquote>"
-    )
-    await status_msg.edit_text(final_report, parse_mode="HTML")
+    if current_status == "running":
+        set_quest_status(quest_id, "completed")
+        final_range_str = f"{max_msg_id} to 1" if forward_mode == "reverse_order" else f"1 to {max_msg_id}"
+        final_report = (
+            f"✅ Quest Completed for <b>{channel_title}</b>!\n\n"
+            f"<blockquote>• <b>Topic ID:</b> <code>{topic_id}</code>\n"
+            f"• <b>Total ids:</b> <code>{max_msg_id}</code>\n"
+            f"• <b>Successfully forwarded ides:</b> <code>{success_count}</code>\n"
+            f"• <b>Skipd ides:</b> <code>{skipped_count}</code>\n\n"
+            f"Completed id {final_range_str}\n"
+            f"FloodWait timer: <code>none</code></blockquote>"
+        )
+        await status_msg.edit_text(final_report, parse_mode="HTML")
 
+    # Start next pending quest if available
     next_q = get_next_quest()
     if next_q:
-        await asyncio.sleep(5.0)
-        asyncio.create_task(execute_forwarding_quest(context, next_q))
+        await asyncio.sleep(3.0)
+        active_quest_task = asyncio.create_task(execute_forwarding_quest(context, next_q))
     else:
-        is_global_forwarding_active = False
+        active_quest_task = None
 
 @admin_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_global_forwarding_active
+    global active_quest_task
     query = update.callback_query
     data = query.data
 
@@ -600,7 +657,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
         ]
-        pending_count = len(get_all_pending_quests())
+        pending_count = len([q for q in get_all_quests() if q["status"] in ('pending', 'paused', 'running')])
         welcome_text = (
             f"<b>Welcome Admin!</b>\n\n"
             f"<blockquote>📊 Quests currently in queue: <b>{pending_count}</b></blockquote>\n\n"
@@ -613,19 +670,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         user_id = query.from_user.id
         user_sessions[user_id] = {"step": "awaiting_channel"}
-        await query.message.reply_text("Please **forward any message or file** from your source channel here, or supply its channel ID/username.")
+        await query.message.reply_text("Please **forward any message or file** from your source channel here, or supply its channel ID/username (multiple IDs comma or newline separated supported).")
         return
 
     if data.startswith("view_queue_"):
         await query.answer()
         page = int(data.split("_")[2])
-        quests = get_all_pending_quests()
+        quests = get_all_quests()
 
         if not quests:
-            await query.edit_message_text("📋 The pending quest queue is currently empty.")
+            await query.edit_message_text("📋 The quest queue is currently empty.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]))
             return
 
-        per_page = 5
+        per_page = 4
         total_pages = (len(quests) + per_page - 1) // per_page
         page = max(1, min(page, total_pages))
 
@@ -633,13 +690,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_idx = start_idx + per_page
         current_batch = quests[start_idx:end_idx]
 
-        text = f"📋 <b>Pending Quests Queue (Page {page}/{total_pages})</b>\n\n"
+        text = f"📋 <b>Quest Queue Management (Page {page}/{total_pages})</b>\n\n"
         keyboard = []
 
         for idx, q in enumerate(current_batch, start=start_idx + 1):
             mode_label = "Rev" if q["forward_mode"] == "reverse_order" else "Reg"
-            text += f"<blockquote>{idx}. <b>{q['channel_title']}</b> (ID: <code>{q['max_msg_id']}</code> | Mode: <code>{mode_label}</code>)</blockquote>\n"
-            keyboard.append([InlineKeyboardButton(f"❌ Remove #{idx} ({q['channel_title'][:15]})", callback_data=f"del_quest_{q['quest_id']}_{page}")])
+            status_emoji = "🟢" if q["status"] == "running" else ("⏸️" if q["status"] == "paused" else "⏳")
+            text += f"<blockquote>{status_emoji} #{idx}. <b>{q['channel_title']}</b> (Max ID: <code>{q['max_msg_id']}</code> | {mode_label} | <b>{q['status']}</b>)</blockquote>\n"
+            
+            row_btns = []
+            if q["status"] == "running":
+                row_btns.append(InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_quest_{q['quest_id']}_{page}"))
+                row_btns.append(InlineKeyboardButton("⏹️ Stop & Remove", callback_data=f"stop_quest_{q['quest_id']}_{page}"))
+            elif q["status"] == "paused":
+                row_btns.append(InlineKeyboardButton("▶️ Resume", callback_data=f"resume_quest_{q['quest_id']}_{page}"))
+                row_btns.append(InlineKeyboardButton("🗑️ Remove", callback_data=f"del_quest_{q['quest_id']}_{page}"))
+            else:
+                row_btns.append(InlineKeyboardButton("🗑️ Remove", callback_data=f"del_quest_{q['quest_id']}_{page}"))
+            keyboard.append(row_btns)
 
         nav_row = []
         if page > 1:
@@ -654,20 +722,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
         return
 
-    if data.startswith("del_quest_"):
+    if data.startswith("pause_quest_") or data.startswith("resume_quest_") or data.startswith("stop_quest_") or data.startswith("del_quest_"):
         parts = data.split("_")
+        action = parts[0]
         quest_id = int(parts[2])
         page = int(parts[3])
 
-        remove_quest_from_db(quest_id)
-        await query.answer("🗑️ Quest removed successfully from queue!", show_alert=True)
+        if action == "pause":
+            set_quest_status(quest_id, "paused")
+            await query.answer("⏸️ Quest paused successfully!", show_alert=True)
+        elif action == "resume":
+            set_quest_status(quest_id, "pending")
+            await query.answer("▶️ Quest resumed!", show_alert=True)
+            # If nothing currently running, trigger execution
+            if not get_active_running_quest():
+                next_q = get_next_quest()
+                if next_q:
+                    active_quest_task = asyncio.create_task(execute_forwarding_quest(context, next_q))
+        elif action == "stop" or action == "del":
+            remove_quest_from_db(quest_id)
+            await query.answer("🗑️ Quest stopped and removed from queue!", show_alert=True)
 
-        quests = get_all_pending_quests()
+        # Refresh queue view
+        quests = get_all_quests()
         if not quests:
-            await query.edit_message_text("📋 All pending quests have been cleared from the queue.")
+            await query.edit_message_text("📋 All quests have been cleared from the queue.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]))
             return
 
-        per_page = 5
+        per_page = 4
         total_pages = (len(quests) + per_page - 1) // per_page
         page = min(page, total_pages)
 
@@ -675,13 +757,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_idx = start_idx + per_page
         current_batch = quests[start_idx:end_idx]
 
-        text = f"📋 <b>Pending Quests Queue (Page {page}/{total_pages})</b>\n\n"
+        text = f"📋 <b>Quest Queue Management (Page {page}/{total_pages})</b>\n\n"
         keyboard = []
 
         for idx, q in enumerate(current_batch, start=start_idx + 1):
             mode_label = "Rev" if q["forward_mode"] == "reverse_order" else "Reg"
-            text += f"<blockquote>{idx}. <b>{q['channel_title']}</b> (ID: <code>{q['max_msg_id']}</code> | Mode: <code>{mode_label}</code>)</blockquote>\n"
-            keyboard.append([InlineKeyboardButton(f"❌ Remove #{idx} ({q['channel_title'][:15]})", callback_data=f"del_quest_{q['quest_id']}_{page}")])
+            status_emoji = "🟢" if q["status"] == "running" else ("⏸️" if q["status"] == "paused" else "⏳")
+            text += f"<blockquote>{status_emoji} #{idx}. <b>{q['channel_title']}</b> (Max ID: <code>{q['max_msg_id']}</code> | {mode_label} | <b>{q['status']}</b>)</blockquote>\n"
+            
+            row_btns = []
+            if q["status"] == "running":
+                row_btns.append(InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_quest_{q['quest_id']}_{page}"))
+                row_btns.append(InlineKeyboardButton("⏹️ Stop & Remove", callback_data=f"stop_quest_{q['quest_id']}_{page}"))
+            elif q["status"] == "paused":
+                row_btns.append(InlineKeyboardButton("▶️ Resume", callback_data=f"resume_quest_{q['quest_id']}_{page}"))
+                row_btns.append(InlineKeyboardButton("🗑️ Remove", callback_data=f"del_quest_{q['quest_id']}_{page}"))
+            else:
+                row_btns.append(InlineKeyboardButton("🗑️ Remove", callback_data=f"del_quest_{q['quest_id']}_{page}"))
+            keyboard.append(row_btns)
 
         nav_row = []
         if page > 1:
@@ -708,35 +801,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_control_panel(update, context, user_id)
 
     elif data == "automated_forward":
-        topic_id = state["topic_id"]
         source_chat_id = state["channel_id"]
         max_msg_id = state["max_msg_id"]
         mode = state.get("forward_mode", "regular")
         channel_title = state.get("channel_title", "Source Channel")
 
-        add_quest_to_db(user_id, source_chat_id, channel_title, topic_id, max_msg_id, mode)
+        add_quest_to_db(user_id, source_chat_id, channel_title, max_msg_id, mode)
 
-        if not is_global_forwarding_active:
+        if not get_active_running_quest():
             next_q = get_next_quest()
             if next_q:
-                asyncio.create_task(execute_forwarding_quest(context, next_q))
+                active_quest_task = asyncio.create_task(execute_forwarding_quest(context, next_q))
                 await query.edit_message_text(f"🚀 Quest added & started immediately for <b>{channel_title}</b>!", parse_mode="HTML")
         else:
-            await query.edit_message_text(f"📌 Quest successfully added to queue for <b>{channel_title}</b>. It will automatically execute once prior quests finish!", parse_mode="HTML")
+            await query.edit_message_text(f"📌 Quest successfully added to queue for <b>{channel_title}</b>. It will automatically execute once active quest finishes!", parse_mode="HTML")
 
         user_sessions.pop(user_id, None)
 
     elif data == "finish_process":
         files = state["files"]
-        topic_id = state["topic_id"]
         mode = state.get("forward_mode", "regular")
         dest_group = get_destination_group_id()
+        channel_title = state.get("channel_title", "Files Batch")
 
         if not files:
             await query.answer("⚠️ No files saved to send yet!", show_alert=True)
             return
 
-        await query.edit_message_text("⏳ Processing queued files...")
+        # Create topic for files batch right now
+        topic_id = None
+        try:
+            forum_topics = await context.bot.get_forum_topics(chat_id=dest_group)
+            for topic in forum_topics:
+                if topic.name.strip().lower() == channel_title.strip().lower():
+                    topic_id = topic.message_thread_id
+                    break
+        except Exception:
+            pass
+
+        if not topic_id:
+            try:
+                new_topic = await context.bot.create_forum_topic(chat_id=dest_group, name=channel_title)
+                topic_id = new_topic.message_thread_id
+            except Exception:
+                topic_id = 1
+
+        await query.edit_message_text(f"⏳ Processing queued files into topic <code>{topic_id}</code>...", parse_mode="HTML")
         if mode == "reverse_order":
             files.reverse()
 
@@ -760,7 +870,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="✅ All queued files have been successfully sent!")
         user_sessions.pop(user_id, None)
 
-# Custom web health check handler to fix Render 404 Not Found error
 async def root_health_check(request):
     return web.Response(text="Bot is running!", status=200)
 
@@ -776,12 +885,12 @@ def main():
     app.add_handler(MessageHandler(filters.ATTACHMENT | filters.FORWARDED, handle_message))
 
     async def post_init(application):
-        global is_global_forwarding_active
-        if not is_global_forwarding_active:
+        global active_quest_task
+        if not get_active_running_quest():
             next_q = get_next_quest()
             if next_q:
                 logger.info(f"Resuming pending quests from database queue...")
-                asyncio.create_task(execute_forwarding_quest(application, next_q))
+                active_quest_task = asyncio.create_task(execute_forwarding_quest(application, next_q))
 
     app.post_init = post_init
 
@@ -792,10 +901,8 @@ def main():
             await app.initialize()
             await app.start()
             
-            # Set webhook with Telegram
             await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
             
-            # Custom Webhook request handler for python-telegram-bot v21+
             async def webhook_handler(request):
                 try:
                     data = await request.json()
@@ -806,7 +913,6 @@ def main():
                     logger.error(f"Error handling incoming webhook request: {e}")
                     return web.Response(status=500)
             
-            # Create custom aiohttp web server with root health check and telegram webhook route
             web_app = web.Application()
             web_app.router.add_get("/", root_health_check)
             web_app.router.add_post(f"/{TOKEN}", webhook_handler)
@@ -818,7 +924,6 @@ def main():
             
             logger.info(f"Web server started on port {PORT}")
             
-            # Keep running forever
             while True:
                 await asyncio.sleep(3600)
 
