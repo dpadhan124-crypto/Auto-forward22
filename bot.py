@@ -128,7 +128,6 @@ def clear_entire_database():
     with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
         conn.execute("DELETE FROM quest_queue")
         conn.execute("DELETE FROM bot_settings")
-        # Ensure sqlite sequence is reset so IDs start at 1 again
         conn.execute("DELETE FROM sqlite_sequence WHERE name='quest_queue'")
         conn.commit()
 
@@ -315,25 +314,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status = await update.message.reply_text(f"🔍 Probing <b>{len(channels)}</b> channel(s)...", parse_mode="HTML")
         linked = []
+        valid_channels = []
+        
         for idx, (ident, title_pre) in enumerate(channels, 1):
             try:
                 chat = await context.bot.get_chat(ident)
-                max_msg_id = 10000 # Stub for probe
-                user_sessions[user_id] = {"step": "collecting_files", "channel_id": chat.id, "channel_title": chat.title or title_pre or "Source", "max_msg_id": max_msg_id, "forward_mode": "regular", "files": []}
-                linked.append(f"{idx}. {chat.title} (<code>{chat.id}</code>)")
-            except Exception as e: logger.error(f"Failed {ident}: {e}")
+                channel_title = chat.title or title_pre or "Source"
+                
+                # Send a test message to get exact ID, then immediately delete it.
+                try:
+                    test_msg = await context.bot.send_message(chat_id=chat.id, text="🔍")
+                    max_msg_id = test_msg.message_id
+                    await test_msg.delete()
+                except Exception as e:
+                    logger.warning(f"Could not send probe message to {chat.id}, using fallback. Error: {e}")
+                    max_msg_id = 10000  # Fallback just in case
 
-        if linked:
+                valid_channels.append({
+                    "channel_id": chat.id,
+                    "channel_title": channel_title,
+                    "max_msg_id": max_msg_id
+                })
+                linked.append(f"{idx}. {channel_title} (<code>{chat.id}</code>) - [Total IDs: {max_msg_id}]")
+            except Exception as e: 
+                logger.error(f"Failed to probe {ident}: {e}")
+
+        if valid_channels:
+            user_sessions[user_id] = {
+                "step": "collecting_files", 
+                "channels": valid_channels, 
+                "forward_mode": "regular"
+            }
             await status.edit_text("✅ Linked:\n" + "\n".join(linked), parse_mode="HTML")
             await send_control_panel(update, context, user_id)
-        else: await status.edit_text("❌ Failed to resolve channels.")
+        else: 
+            await status.edit_text("❌ Failed to resolve any channels.")
 
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     st = user_sessions[user_id]
     mode_str = "Reverse Order" if st.get("forward_mode") == "reverse_order" else "Regular"
-    text = f"⚙️ <b>Configuration Panel</b>\n\n<blockquote>• Mode: <code>{mode_str}</code></blockquote>\n<i>Choose an option:</i>"
+    chan_count = len(st.get("channels", []))
+    
+    text = f"⚙️ <b>Configuration Panel</b>\n\n<blockquote>• Selected Channels: <code>{chan_count}</code>\n• Mode: <code>{mode_str}</code></blockquote>\n<i>Choose an option:</i>"
     kb = [[InlineKeyboardButton(f"Mode: {mode_str}", callback_data="toggle_mode")],
-          [InlineKeyboardButton("🤖 Automated Forwarding", callback_data="automated_forward")]]
+          [InlineKeyboardButton("🤖 Start Automated Forwarding", callback_data="automated_forward")]]
+    
+    # Send a new panel message and store its ID if we need it later
     msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     st["panel_message_id"] = msg.message_id
 
@@ -364,23 +390,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "start_forward":
         await query.answer()
         user_sessions[query.from_user.id] = {"step": "awaiting_channel"}
-        await query.message.reply_text("Please forward a message or send channel ID(s).")
+        await query.message.reply_text("Please forward a message or send channel ID(s) (comma separated or on new lines).")
 
     elif data == "toggle_mode":
         st = user_sessions.get(query.from_user.id)
         if st:
             st["forward_mode"] = "reverse_order" if st.get("forward_mode") == "regular" else "regular"
+            # Delete the old panel to prevent clutter and send a fresh one
+            await query.message.delete()
             await send_control_panel(update, context, query.from_user.id)
 
     elif data == "automated_forward":
         st = user_sessions.pop(query.from_user.id, None)
-        if st:
-            add_quest_to_db(query.from_user.id, st["channel_id"], st["channel_title"], st["max_msg_id"], st["forward_mode"])
+        if st and "channels" in st:
+            # Add a quest for every valid channel fetched
+            for ch in st["channels"]:
+                add_quest_to_db(
+                    query.from_user.id, 
+                    ch["channel_id"], 
+                    ch["channel_title"], 
+                    ch["max_msg_id"], 
+                    st["forward_mode"]
+                )
+                
             if not get_active_running_quest():
                 active_quest_task = asyncio.create_task(execute_forwarding_quest(context, get_next_quest()))
-                await query.edit_message_text("🚀 Quest started!")
+                await query.edit_message_text(f"🚀 Started {len(st['channels'])} Quest(s)!")
             else:
-                await query.edit_message_text("📌 Quest added to queue.")
+                await query.edit_message_text(f"📌 Added {len(st['channels'])} Quest(s) to the queue.")
 
     elif data.startswith("view_queue_"):
         await query.answer()
@@ -426,15 +463,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await button_callback(update, context)
 
     elif data == "clear_all":
-        # Wipes all tables
         clear_entire_database()
         
-        # Stop any running loop instantly
         if active_quest_task:
             active_quest_task.cancel()
             active_quest_task = None
             
-        await query.answer("💥 All database records cleared (Quests & Settings)!", show_alert=True)
+        await query.answer("💥 All database records cleared!", show_alert=True)
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
         await query.edit_message_text("📋 Entire database has been wiped clean.", reply_markup=InlineKeyboardMarkup(kb))
 
