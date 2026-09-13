@@ -484,7 +484,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"📋 <b>Quest Queue (Page {page})</b>\n\nReview your currently running and pending tasks:\n\n"
         kb = []
-        for i, q in enumerate(quests[(page-1)*4:page*4], start=(page-1)*4+1):
+        
+        items_per_page = 4
+        total_pages = (len(quests) + items_per_page - 1) // items_per_page
+        
+        for i, q in enumerate(quests[(page-1)*items_per_page : page*items_per_page], start=(page-1)*items_per_page+1):
             
             # Map status to a nice emoji
             status_emoji = "▶️" if q['status'] == "running" else ("⏸️" if q['status'] == "paused" else "⏳")
@@ -501,6 +505,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.append(InlineKeyboardButton(f"❌ Cancel {short_title}", callback_data=f"del_{q['quest_id']}"))
             kb.append(row)
         
+        # Add Pagination Buttons if there are multiple pages
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_queue_{page-1}"))
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_queue_{page+1}"))
+            
+        if nav_buttons:
+            kb.append(nav_buttons)
+            
         kb.append([InlineKeyboardButton("🗑️ Clear Entire Database", callback_data="clear_all")])
         kb.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
