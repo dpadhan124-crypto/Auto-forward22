@@ -146,7 +146,7 @@ def admin_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id not in ADMIN_IDS:
-            if update.message: await update.message.reply_text("❌ Unauthorized.")
+            if update.message: await update.message.reply_text("❌ <b>Unauthorized access.</b>", parse_mode="HTML")
             elif update.callback_query: await update.callback_query.answer("❌ Unauthorized action.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
@@ -159,14 +159,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_main_menu(reply_func, is_edit=False):
     b1, b2 = get_setting("bot1_username", DEFAULT_BOT1_USERNAME), get_setting("bot2_username", DEFAULT_BOT2_USERNAME)
     keyboard = [
-        [InlineKeyboardButton("🤖 Add Bot 1 to Channel", url=f"https://t.me/{b1}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
-        [InlineKeyboardButton("🤖 Add Bot 2 to Channel", url=f"https://t.me/{b2}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")],
         [InlineKeyboardButton("➡️ Forward Messages", callback_data="start_forward")],
         [InlineKeyboardButton("📋 View & Manage Quests", callback_data="view_queue_1")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
+        [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")],
+        [
+            InlineKeyboardButton("🤖 Add Bot 1", url=f"https://t.me/{b1}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins"),
+            InlineKeyboardButton("🤖 Add Bot 2", url=f"https://t.me/{b2}?startchannel=true&admin=post_messages+edit_messages+delete_messages+ban_users+invite_users+change_info+pin_messages+manage_video_chats+manage_topics+add_admins")
+        ]
     ]
     pending_count = len(get_all_quests())
-    text = f"<b>Welcome Admin!</b>\n\n<blockquote>📊 Quests currently in queue: <b>{pending_count}</b></blockquote>\n\n<i>Choose an option:</i>"
+    
+    text = (
+        "<b>✨ Welcome to the Automated Forwarding Bot!</b>\n\n"
+        "I can help you bulk-forward messages from source channels directly to topics in your destination group seamlessly.\n\n"
+        "<b>📖 Quick Start Guide:</b>\n"
+        "1️⃣ Go to <b>⚙️ Settings</b> to set your Target Group ID.\n"
+        "2️⃣ Make sure I am an <b>Admin</b> in all Source Channels.\n"
+        "3️⃣ Tap <b>➡️ Forward Messages</b> and send your Channel IDs.\n\n"
+        f"<blockquote>📊 <b>Quests in Queue:</b> <code>{pending_count}</code></blockquote>\n\n"
+        "<i>Select an option below to get started:</i>"
+    )
     
     if is_edit:
         await reply_func(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -198,7 +210,7 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
     set_quest_status(quest_id, "running")
     status_msg = await context.bot.send_message(
         chat_id=user_id,
-        text=f"⏳ Quest Running for <b>{channel_title}</b>\nStarting forwarding...",
+        text=f"⏳ <b>Quest Started!</b>\n\nPreparing to forward messages for: <b>{channel_title}</b>",
         parse_mode="HTML"
     )
 
@@ -210,12 +222,16 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
         while live_status_data["running"]:
             try:
                 text = (
-                    f"⏳ Automated forwarding running (<b>{channel_title}</b>)\n\n"
-                    f"<blockquote>• <b>Topic ID:</b> <code>{topic_id}</code>\n"
-                    f"• <b>Total IDs:</b> <code>{max_msg_id}</code>\n"
-                    f"• <b>Successfully forwarded:</b> <code>{success_count}</code>\n"
-                    f"• <b>Skipped IDs:</b> <code>{skipped_count}</code>\n"
-                    f"• <b>FloodWait timer:</b> <code>{live_status_data['flood']}</code></blockquote>"
+                    f"🔄 <b>Forwarding in Progress...</b>\n"
+                    f"📁 <b>Channel:</b> {channel_title}\n\n"
+                    f"<blockquote>"
+                    f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
+                    f"• <b>Total Messages:</b> <code>{max_msg_id}</code>\n"
+                    f"• <b>✅ Forwarded:</b> <code>{success_count}</code>\n"
+                    f"• <b>⏭️ Skipped/Deleted:</b> <code>{skipped_count}</code>\n"
+                    f"• <b>⏱️ FloodWait:</b> <code>{live_status_data['flood']}</code>"
+                    f"</blockquote>\n\n"
+                    f"<i>Bot is working safely to avoid telegram limits.</i>"
                 )
                 await status_msg.edit_text(text, parse_mode="HTML")
             except Exception: pass
@@ -259,7 +275,11 @@ async def execute_forwarding_quest(context: ContextTypes.DEFAULT_TYPE, quest: di
 
     if current_status == "running":
         set_quest_status(quest_id, "completed")
-        await status_msg.edit_text(f"✅ Quest Completed for <b>{channel_title}</b>!", parse_mode="HTML")
+        await status_msg.edit_text(
+            f"✅ <b>Quest Completed Successfully!</b>\n\n"
+            f"All readable messages from <b>{channel_title}</b> have been forwarded.", 
+            parse_mode="HTML"
+        )
 
     # Move to next quest
     next_q = get_next_quest()
@@ -299,7 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keys = {"setting_dest_group": "destination_group_id", "setting_bot1": "bot1_username", "setting_bot2": "bot2_username"}
         set_setting(keys[step], val)
         user_sessions.pop(user_id, None)
-        await update.message.reply_text(f"✅ Updated successfully: <code>{val}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"✅ <b>Setting Updated Successfully!</b>\n\nNew Value: <code>{val}</code>", parse_mode="HTML")
         await send_main_menu(update.message.reply_text)
 
     elif step == "awaiting_channel":
@@ -310,9 +330,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for ident in parse_channel_inputs(update.message.text): channels.append((ident, None))
 
         if not channels:
-            return await update.message.reply_text("❌ No valid channels recognized.")
+            return await update.message.reply_text("❌ No valid channels recognized. Please try sending the IDs again.")
 
-        status = await update.message.reply_text(f"🔍 Probing <b>{len(channels)}</b> channel(s)...", parse_mode="HTML")
+        status = await update.message.reply_text(f"🔍 <b>Probing {len(channels)} channel(s)...</b>\n<i>Please wait while I check admin rights and fetch data.</i>", parse_mode="HTML")
         linked = []
         valid_channels = []
         
@@ -335,9 +355,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "channel_title": channel_title,
                     "max_msg_id": max_msg_id
                 })
-                linked.append(f"{idx}. {channel_title} (<code>{chat.id}</code>) - [Total IDs: {max_msg_id}]")
+                linked.append(f"✅ <b>{channel_title}</b>\n└ ID: <code>{chat.id}</code> | Msg Count: {max_msg_id}")
             except Exception as e: 
                 logger.error(f"Failed to probe {ident}: {e}")
+                linked.append(f"❌ <b>Failed:</b> <code>{ident}</code>\n└ <i>Ensure bot is Admin.</i>")
 
         if valid_channels:
             user_sessions[user_id] = {
@@ -345,19 +366,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "channels": valid_channels, 
                 "forward_mode": "regular"
             }
-            await status.edit_text("✅ Linked:\n" + "\n".join(linked), parse_mode="HTML")
+            await status.edit_text("📋 <b>Channel Probe Results:</b>\n\n" + "\n\n".join(linked), parse_mode="HTML")
             await send_control_panel(update, context, user_id)
         else: 
-            await status.edit_text("❌ Failed to resolve any channels.")
+            await status.edit_text("❌ <b>Failed to resolve any channels.</b>\nPlease make sure the bot is added to the channel as an Admin.", parse_mode="HTML")
 
 async def send_control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     st = user_sessions[user_id]
-    mode_str = "Reverse Order" if st.get("forward_mode") == "reverse_order" else "Regular"
+    mode_str = "Reverse Order (Newest First)" if st.get("forward_mode") == "reverse_order" else "Regular (Oldest First)"
     chan_count = len(st.get("channels", []))
     
-    text = f"⚙️ <b>Configuration Panel</b>\n\n<blockquote>• Selected Channels: <code>{chan_count}</code>\n• Mode: <code>{mode_str}</code></blockquote>\n<i>Choose an option:</i>"
-    kb = [[InlineKeyboardButton(f"Mode: {mode_str}", callback_data="toggle_mode")],
-          [InlineKeyboardButton("🤖 Start Automated Forwarding", callback_data="automated_forward")]]
+    text = (
+        "⚙️ <b>Forwarding Configuration Panel</b>\n\n"
+        "You are about to queue these channels for automated forwarding. Review your settings below:\n\n"
+        f"<blockquote>• <b>Channels Selected:</b> <code>{chan_count}</code>\n"
+        f"• <b>Forward Mode:</b> <code>{mode_str}</code></blockquote>\n\n"
+        "<i>Click 'Toggle Mode' to change the sorting, or 'Start' to push these quests into the queue!</i>"
+    )
+    kb = [[InlineKeyboardButton(f"🔁 Toggle Mode: {mode_str.split(' ')[0]}", callback_data="toggle_mode")],
+          [InlineKeyboardButton("🚀 Start Automated Forwarding", callback_data="automated_forward")]]
     
     # Send a new panel message and store its ID if we need it later
     msg = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
@@ -375,22 +402,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "open_settings":
         await query.answer()
-        text = "⚙️ <b>Settings</b>"
-        kb = [[InlineKeyboardButton("✏️ Group ID", callback_data="set_group_id")],
-              [InlineKeyboardButton("✏️ Bot 1 Name", callback_data="set_bot1_name")],
-              [InlineKeyboardButton("✏️ Bot 2 Name", callback_data="set_bot2_name")],
-              [InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
+        text = (
+            "⚙️ <b>Bot Settings</b>\n\n"
+            "Here you can configure the default IDs and bot usernames. "
+            "Click a button below to edit its value.\n\n"
+            "<i>Current Setup:</i>\n"
+            f"• <b>Group ID:</b> <code>{get_setting('destination_group_id', str(DEFAULT_DESTINATION_GROUP_ID))}</code>"
+        )
+        kb = [[InlineKeyboardButton("✏️ Edit Group ID", callback_data="set_group_id")],
+              [InlineKeyboardButton("✏️ Edit Bot 1 Name", callback_data="set_bot1_name"),
+               InlineKeyboardButton("✏️ Edit Bot 2 Name", callback_data="set_bot2_name")],
+              [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
     elif data in ["set_group_id", "set_bot1_name", "set_bot2_name"]:
         await query.answer()
         user_sessions[query.from_user.id] = {"step": data.replace("set_", "setting_").replace("_name", "")}
-        await query.message.reply_text("📥 Send the new value:")
+        await query.message.reply_text(
+            "📥 <b>Send the new value for this setting:</b>\n\n"
+            "<i>Tip: You can copy and paste the ID or username directly into the chat.</i>",
+            parse_mode="HTML"
+        )
 
     elif data == "start_forward":
         await query.answer()
         user_sessions[query.from_user.id] = {"step": "awaiting_channel"}
-        await query.message.reply_text("Please forward a message or send channel ID(s) (comma separated or on new lines).")
+        await query.message.reply_text(
+            "📁 <b>Forwarding Setup</b>\n\n"
+            "Please send the <b>Channel ID(s)</b> you want to extract from, or simply <b>forward a message</b> from that channel to me.\n\n"
+            "<i>Formats accepted:</i>\n"
+            "• <code>-1001234567890</code>\n"
+            "• <code>@MyPublicChannel</code>\n"
+            "• <i>Multiple IDs separated by commas or new lines.</i>",
+            parse_mode="HTML"
+        )
 
     elif data == "toggle_mode":
         st = user_sessions.get(query.from_user.id)
@@ -415,48 +460,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             if not get_active_running_quest():
                 active_quest_task = asyncio.create_task(execute_forwarding_quest(context, get_next_quest()))
-                await query.edit_message_text(f"🚀 Started {len(st['channels'])} Quest(s)!")
+                await query.edit_message_text(f"🚀 <b>Success!</b> Started {len(st['channels'])} Quest(s). Check the Main Menu for updates.", parse_mode="HTML")
             else:
-                await query.edit_message_text(f"📌 Added {len(st['channels'])} Quest(s) to the queue.")
+                await query.edit_message_text(f"📌 <b>Success!</b> Added {len(st['channels'])} Quest(s) to the queue.", parse_mode="HTML")
 
     elif data.startswith("view_queue_"):
         await query.answer()
         page = int(data.split("_")[-1])
         quests = get_all_quests()
         if not quests:
-            kb = [[InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
-            return await query.edit_message_text("📋 Queue is empty.", reply_markup=InlineKeyboardMarkup(kb))
+            kb = [[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]
+            return await query.edit_message_text("📋 <b>Queue is completely empty.</b>\n\nReady for new tasks!", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
-        text = f"📋 <b>Quest Queue (Page {page})</b>\n\n"
+        text = f"📋 <b>Quest Queue (Page {page})</b>\n\nReview your currently running and pending tasks:\n\n"
         kb = []
         for i, q in enumerate(quests[(page-1)*4:page*4], start=(page-1)*4+1):
-            text += f"<blockquote>#{i}. <b>{q['channel_title']}</b> | {q['status']}</blockquote>\n"
+            
+            # Map status to a nice emoji
+            status_emoji = "▶️" if q['status'] == "running" else ("⏸️" if q['status'] == "paused" else "⏳")
+            
+            text += f"<blockquote><b>#{i}. {q['channel_title']}</b>\nStatus: {status_emoji} {q['status'].capitalize()}</blockquote>\n"
             
             # Format the channel title for the button so it doesn't get too long
-            short_title = q['channel_title'][:20] + ("..." if len(q['channel_title']) > 20 else "")
+            short_title = q['channel_title'][:15] + ("..." if len(q['channel_title']) > 15 else "")
             
             row = []
             if q["status"] == "running": row.append(InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_{q['quest_id']}"))
             elif q["status"] == "paused": row.append(InlineKeyboardButton("▶️ Resume", callback_data=f"resume_{q['quest_id']}"))
             
-            row.append(InlineKeyboardButton(f"❌ {short_title}", callback_data=f"del_{q['quest_id']}"))
+            row.append(InlineKeyboardButton(f"❌ Cancel {short_title}", callback_data=f"del_{q['quest_id']}"))
             kb.append(row)
         
-        kb.append([InlineKeyboardButton("🗑️ Clear All Data", callback_data="clear_all")])
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="back_home")])
+        kb.append([InlineKeyboardButton("🗑️ Clear Entire Database", callback_data="clear_all")])
+        kb.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
     elif data.startswith("del_") or data.startswith("pause_") or data.startswith("resume_"):
         action, q_id = data.split("_")[0], int(data.split("_")[1])
         if action == "del":
             remove_quest_from_db(q_id)
-            await query.answer("❌ Quest Deleted!", show_alert=True)
+            await query.answer("❌ Quest Cancelled and Deleted!", show_alert=True)
         elif action == "pause":
             set_quest_status(q_id, "paused")
-            await query.answer("⏸️ Paused!", show_alert=True)
+            await query.answer("⏸️ Quest Paused! It will wait until you resume it.", show_alert=True)
         elif action == "resume":
             set_quest_status(q_id, "pending")
-            await query.answer("▶️ Resumed!", show_alert=True)
+            await query.answer("▶️ Quest Resumed! Added back to the active queue.", show_alert=True)
             if not get_active_running_quest():
                 active_quest_task = asyncio.create_task(execute_forwarding_quest(context, get_next_quest()))
         
@@ -469,9 +518,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active_quest_task.cancel()
             active_quest_task = None
             
-        await query.answer("💥 All database records cleared!", show_alert=True)
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
-        await query.edit_message_text("📋 Entire database has been wiped clean.", reply_markup=InlineKeyboardMarkup(kb))
+        await query.answer("💥 All database records and active tasks cleared!", show_alert=True)
+        kb = [[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_home")]]
+        await query.edit_message_text("🧹 <b>Database Wiped Clean.</b>\n\nAll quests have been deleted and stopped.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 # --- Web Server Health Check ---
 async def root_health_check(request):
