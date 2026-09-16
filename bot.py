@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables Configuration
 TOKEN = os.getenv("BOT_TOKEN")
-DEFAULT_DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004441022456"))
-DEFAULT_BOT1_USERNAME = os.getenv("BOT1_USERNAME", "Dps_Storiesbot")
-DEFAULT_BOT2_USERNAME = os.getenv("BOT2_USERNAME", "fm_Storiesbot")
+DEFAULT_DESTINATION_GROUP_ID = int(os.getenv("DESTINATION_GROUP_ID", "-1004470555189"))
+DEFAULT_BOT1_USERNAME = os.getenv("BOT1_USERNAME", "Dps_xbot")
+DEFAULT_BOT2_USERNAME = os.getenv("BOT2_USERNAME", "dps_Storiesbot")
 
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
